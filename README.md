@@ -117,19 +117,34 @@ model), working from a requirement specification supplied by the repository
 author. The author designed the tool, directed the implementation, and
 reviewed and tested the result before publishing.
 
-The extraction logic in particular went through two bug-fix rounds during
-that session — one for URLs lost inside HTML attributes, one for a
-regression that dropped the message subject — which is why the test cases
-below are in the repository.
+Four bugs were found during development, and the sequence matters more than
+the count:
+
+| # | Bug | How it surfaced |
+|---|---|---|
+| 1 | URLs lost inside HTML attributes | caught immediately, by unit test |
+| 2 | Message subject dropped from the code-search blob | caught immediately, regression of fix 1 |
+| 3 | Wrong assumption about the API response shape | **only on a live email** |
+| 4 | `read` received the whole argv list instead of its first element | **only on a live run** |
+
+Bugs 3 and 4 are the instructive ones. The unit tests fed the code the
+author's own idea of the API shape, so they could not catch a wrong idea
+about that shape. And `read` was only ever called directly in tests, never
+through argument parsing — so a function that had never worked looked fine.
+
+Both were found only after the first real email arrived.
 
 ## Tests
 
 `tests/test_extract.py` runs without network access and covers the extraction
-logic:
+logic, including all three response shapes the API returns:
 
 ```bash
 python3 tests/test_extract.py
 ```
+
+19 tests. `TestApiShapes` encodes the real responses verbatim — including the
+one that caused bug 3.
 
 Live mail delivery is **not** covered by automated tests — sending SMTP mail
 from a test environment is not reliably possible. Verify it once by hand.
