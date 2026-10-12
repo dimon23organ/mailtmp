@@ -1,0 +1,26 @@
+# Локальное состояние — сюда не попадает
+state.json
+*.state
+*.log
+
+# Ключи и секреты
+*.pem
+*.key
+*.kdbx
+id_*
+*.env
+.env
+authorized_keys
+
+# Личные и внутренние документы.
+# В репозитории допустимы только два .md — описание и гайд.
+*.md
+!README.md
+!GUIDE.ru.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

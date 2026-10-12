@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+mailtmp — временная почта для регистраций, поверх публичного API mail.tm.
+
+Никаких внешних зависимостей: только стандартная библиотека.
+Домен не нужен свой, VPS не нужен свой — это единственный способ получить
+реально принимающий адрес без своей инфраструктуры.
+
+Команды:
+    mailtmp new              новый адрес, запомнить его
+    mailtmp addr             показать текущий адрес
+    mailtmp domains          какие домены доступны сейчас
+    mailtmp inbox            список писем
+    mailtmp read N           показать письмо N
+    mailtmp wait [сек]       ждать письмо и вытащить код/ссылку (по умолч. 90)
+    mailtmp reset            забыть текущий адрес
+"""
+
+import json
+import os
+import random
+import re
+import string
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = "https://api.mail.tm"
+STATE_DIR = os.path.expanduser("~/.local/state/mailtmp")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+# Коды подтверждения: 4–8 символов, цифры и буквы, иногда с разделителем.
+CODE_RE = re.compile(r"\b(\d{4,8})\b")
+CODE_LABELLED = re.compile(
+    r"(?:code|код|pin|пин|otp|verification|verify|подтверж)[^\w]{0,30}?(\d{4,8})",
+    re.IGNORECASE,
+)
+URL_RE = re.compile(r"https?://[^\s<>\"')]+")
+
+
+def die(msg, code=1):
+    print(f"mailtmp: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def api(method, path, body=None, token=None, timeout=30):
+    url = path if path.startswith("http") else API + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/ld+json")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:300]
+        die(f"HTTP {e.code} на {method} {path}\n{detail}")
+    except urllib.error.URLError as e:
+        die(f"сеть недоступна: {e.reason}")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(s, f, indent=2)
+    os.chmod(STATE_FILE, 0o600)
+
+
+def random_pw(n=20):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.SystemRandom().choice(alphabet) for _ in range(n))
+
+
+def random_name(n=10):
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.SystemRandom().choice(alphabet) for _ in range(n))
+
+
+def require_state():
+    s = load_state()
+    if not s.get("address") or not s.get("token"):
+        die("нет текущего адреса — сначала: mailtmp new")
+    return s
+
+
+# ------------------------------------------------------------------ команды
+
+
+def cmd_domains():
+    d = api("GET", "/domains")
+    items = d.get("hydra:member") or d.get("member") or []
+    if not items:
+        die("сервис не вернул ни одного домена")
+    for i in items:
+        print(f"{i['domain']}   {'(активен)' if i.get('isActive', True) else '(неактивен)'}")
+
+
+def cmd_new():
+    d = api("GET", "/domains")
+    items = [i for i in (d.get("hydra:member") or d.get("member") or []) if i.get("isActive", True)]
+    if not items:
+        die("нет активных доменов")
+    domain = random.SystemRandom().choice(items)["domain"]
+
+    address = f"{random_name()}@{domain}"
+    password = random_pw()
+    r = api("POST", "/accounts", {"address": address, "password": password})
+    t = api("POST", "/token", {"address": address, "password": password})
+    token = t.get("token")
+    if not token:
+        die(f"не удалось получить токен для {address}: {r}")
+
+    save_state({"address": address, "password": password, "token": token})
+    print(address)
+    print(STATE_FILE, file=sys.stderr)
+
+
+def cmd_addr():
+    print(require_state()["address"])
+
+
+def cmd_inbox():
+    s = require_state()
+    m = api("GET", "/messages", token=s["token"])
+    items = m.get("hydra:member") or m.get("member") or []
+    if not items:
+        print("пусто")
+        return
+    for i in items:
+        frm = (i.get("from") or {}).get("address", "?")
+        print(f"{i['id'][:8]}  {i.get('createdAt','')[:19]}  {frm:<32}  {i.get('subject','')}")
+
+
+def cmd_read(n):
+    s = require_state()
+    items = api("GET", "/messages", token=s["token"])
+    items = items.get("hydra:member") or items.get("member") or []
+    match = next((i for i in items if i["id"].startswith(n)), None)
+    if not match:
+        die(f"письма с id {n} нет — посмотри список: mailtmp inbox")
+    msg = api("GET", f"/messages/{match['id']}", token=s["token"])
+    print(f"От:    {(msg.get('from') or {}).get('address','?')}")
+    print(f"Тема:  {msg.get('subject','')}")
+    print(f"Дата:  {msg.get('createdAt','')}")
+    print("-" * 60)
+    for part in msg.get("text") or []:
+        body = part.get("value") or part.get("text") or ""
+        if body.strip():
+            print(body[:4000])
+
+
+def extract(msg):
+    """Достать код подтверждения или ссылку из письма.
+
+    Два отдельных блоба, и это важно: для ссылок нужен СЫРОЙ html
+    (тег <a href="..."> содержит URL в атрибуте, и regex <[^>]+> съел бы его
+    вместе с разметкой), а для кодов — очищенный текст.
+    """
+    plain, raw = [], []
+    subject = msg.get("subject") or ""
+    plain.append(subject)
+    raw.append(subject)
+
+    for part in msg.get("text") or []:
+        v = part.get("value") or part.get("text") or ""
+        plain.append(v)
+        raw.append(v)
+
+    for part in msg.get("html") or []:
+        v = part.get("value") or ""
+        raw.append(v)
+        plain.append(re.sub(r"<[^>]+>", " ", v))
+
+    code_blob = "\n".join(plain)
+    url_blob = "\n".join(raw)
+
+    m = CODE_LABELLED.search(code_blob) or CODE_RE.search(code_blob)
+    if m:
+        return m.group(1), None
+    m = URL_RE.search(url_blob)
+    if m:
+        return None, m.group(0)
+    return None, None
+
+
+def cmd_wait(seconds=90):
+    s = require_state()
+    seen = {i["id"] for i in (api("GET", "/messages", token=s["token"]).get("hydra:member") or [])}
+    deadline = time.time() + int(seconds)
+    sys.stderr.write(f"жду новое письмо на {s['address']} (до {seconds} с)…\n")
+    while time.time() < deadline:
+        time.sleep(4)
+        items = api("GET", "/messages", token=s["token"])
+        items = items.get("hydra:member") or items.get("member") or []
+        fresh = [i for i in items if i["id"] not in seen]
+        if not fresh:
+            continue
+        fresh.sort(key=lambda i: i.get("createdAt", ""), reverse=True)
+        for i in fresh:
+            msg = api("GET", f"/messages/{i['id']}", token=s["token"])
+            code, url = extract(msg)
+            frm = (msg.get("from") or {}).get("address", "?")
+            if code:
+                print(code)
+                print(f"от {frm}: {msg.get('subject','')}", file=sys.stderr)
+                return
+            if url:
+                print(url)
+                print(f"от {frm}: {msg.get('subject','')}", file=sys.stderr)
+                return
+            print(f"пришло без кода от {frm}: {msg.get('subject','')}", file=sys.stderr)
+    sys.exit(2)
+
+
+def cmd_reset():
+    try:
+        os.remove(STATE_FILE)
+    except FileNotFoundError:
+        pass
+    print("забыт")
+
+
+def usage():
+    print(__doc__)
+    sys.exit(2)
+
+
+COMMANDS = {
+    "new": lambda a: cmd_new(),
+    "addr": lambda a: cmd_addr(),
+    "domains": lambda a: cmd_domains(),
+    "inbox": lambda a: cmd_inbox(),
+    "read": cmd_read,
+    "wait": lambda a: cmd_wait(a[0] if a else 90),
+    "reset": lambda a: cmd_reset(),
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        usage()
+    fn = COMMANDS.get(sys.argv[1])
+    if not fn:
+        usage()
+    fn(sys.argv[2:])
