@@ -96,6 +96,78 @@ class TestLinkExtraction(unittest.TestCase):
         self.assertIsNone(url)
 
 
+class TestAlphanumericCodes(unittest.TestCase):
+    """Коды вида K3M9XP — Steam, Discord, GitHub. Изначально не ловились
+    вообще: оба старых шаблона искали только \\d{4,8}."""
+
+    def test_alphanumeric_code(self):
+        expect_code(self, {"subject": "Your code: K3M9XP", "text": [{"value": "x"}]},
+                    "K3M9XP")
+
+    def test_letters_only_is_not_a_code(self):
+        # Требование «есть цифра И есть буква» отсекает мусор вида «welcome».
+        code, url = extract({"subject": "", "text": [{"value": "welcome aboard"}]})
+        self.assertIsNone(code)
+
+    def test_digits_only_still_works(self):
+        expect_code(self, {"subject": "code: 445566", "text": [{"value": "x"}]}, "445566")
+
+    def test_code_glued_to_word(self):
+        # «кодabc1234» — слитно, без разделителя.
+        expect_code(self, {"subject": "кодabc1234", "text": [{"value": "x"}]}, "abc1234")
+
+    def test_seven_digits(self):
+        expect_code(self, subject("OTP", "7654321"), "7654321")
+
+
+class TestGroupedDigits(unittest.TestCase):
+    """Код с разделителями: «48 29 13», «1234-5678»."""
+
+    def test_spaces(self):
+        expect_code(self, subject("Your code: 48 29 13", "x"), "482913")
+
+    def test_hyphen(self):
+        expect_code(self, subject("OTP", "1234-5678"), "12345678")
+
+    def test_parentheses(self):
+        expect_code(self, subject("код", "(7391)"), "7391")
+
+    def test_slash_context(self):
+        expect_code(self, subject("Подтверждение", "ref/8823/x"), "8823")
+
+    def test_run_longer_than_eight_is_skipped(self):
+        # 12 цифр подряд — не код. Берётся то, что в теме.
+        expect_code(self, subject("12312", "312312312315"), "12312")
+
+
+class TestBodyBeforeSubject(unittest.TestCase):
+    """В теме часто номер обращения, а не сам код."""
+
+    def test_newer_body_code_wins(self):
+        expect_code(self, {"subject": "старый 111111",
+                           "text": [{"value": "новый 222222"}]}, "222222")
+
+
+class TestKnownLimits(unittest.TestCase):
+    """Документированные ограничения, а не баги."""
+
+    def test_bare_alnum_in_subject_without_label_not_found(self):
+        # Осознанно: без маркера любая строка из 6 символов стала бы «кодом».
+        code, url = extract({"subject": "A1B2C3", "text": [{"value": "ничего"}]})
+        self.assertIsNone(code)
+        self.assertIsNone(url)
+
+    def test_email_address_is_not_a_code(self):
+        code, url = extract({"subject": "", "text": [{"value": "a@b.com"}]})
+        self.assertIsNone(code)
+        self.assertIsNone(url)
+
+    def test_words_do_not_become_codes(self):
+        code, url = extract({"subject": "", "text": [{"value": "ordered coding"}]})
+        self.assertIsNone(code)
+        self.assertIsNone(url)
+
+
 class TestRobustness(unittest.TestCase):
     def test_missing_sections(self):
         code, url = extract({})

@@ -30,13 +30,64 @@ API = "https://api.mail.tm"
 STATE_DIR = os.path.expanduser("~/.local/state/mailtmp")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
-# Коды подтверждения: 4–8 символов, цифры и буквы, иногда с разделителем.
-CODE_RE = re.compile(r"\b(\d{4,8})\b")
-CODE_LABELLED = re.compile(
-    r"(?:code|код|pin|пин|otp|verification|verify|подтверж)[^\w]{0,30}?(\d{4,8})",
+# --- Шаблоны поиска кода -------------------------------------------------
+#
+# Изначально здесь стоял один шаблон \b(\d{4,8})\b, и это было неверно:
+# он не ловил буквенно-цифровые коды (K3M9XP, A7F2, XKCD-2F), не ловил
+# код, слипшийся со словом (кодabc1234), и не ловил код с разделителями
+# (48 29 13). Ниже — три прохода вместо одного.
+#
+# Код считается правдоподобным, если это 4..8 цифр подряд
+# либо 4..10 символов, где есть и цифры, и буквы.
+
+LABEL_RE = re.compile(
+    r"(?:code|codes|код|pin|пин|otp|verification|verify|passcode|пароль|"
+    r"token|токен|security)",
     re.IGNORECASE,
 )
+CANDIDATE_RE = re.compile(r"[A-Za-z0-9]{4,10}")
+DIGITS_RE = re.compile(r"\d{4,10}")
+# Склейка разделителей ВНУТРИ числа: «48 29 13» → 482913, «1234-5678» → 12345678.
+GROUPED_RE = re.compile(r"(?<=\d)[ \u00a0\u2013\u2014-](?=\d)")
+
+# Ссылка ищется по сырому HTML и по тексту.
 URL_RE = re.compile(r"https?://[^\s<>\"')]+")
+
+
+def _plausible(token):
+    """Похоже ли это на код подтверждения."""
+    if token.isdigit():
+        return 4 <= len(token) <= 8
+    has_digit = any(c.isdigit() for c in token)
+    has_alpha = any(c.isalpha() for c in token)
+    return has_digit and has_alpha and 4 <= len(token) <= 10
+
+
+def _ungroup(text):
+    """Убрать разделители внутри чисел, чтобы «48 29 13» читалось как одно."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = GROUPED_RE.sub("", text)
+    return text
+
+
+def _labelled_code(text):
+    """Код рядом со словом-маркером: «ваш код: 7391», «your OTP is K3M9XP»."""
+    for m in LABEL_RE.finditer(text):
+        window = text[m.end(): m.end() + 40]
+        for token in CANDIDATE_RE.findall(window):
+            if _plausible(token):
+                return token
+    return None
+
+
+def _digit_code(text):
+    """Любая последовательность цифр подходящей длины."""
+    for token in DIGITS_RE.findall(_ungroup(text)):
+        if 4 <= len(token) <= 8:
+            return token
+    return None
 
 
 def die(msg, code=1):
@@ -200,31 +251,40 @@ def _parts(value):
 def extract(msg):
     """Достать код подтверждения или ссылку из письма.
 
-    Два отдельных блоба, и это важно: для ссылок нужен СЫРОЙ html
-    (тег <a href="..."> содержит URL в атрибуте, и regex <[^>]+> съел бы его
-    вместе с разметкой), а для кодов — очищенный текст.
+    Порядок проходов важен. Сначала код рядом со словом-маркером, затем
+    любые цифры — и ТЕЛО просматривается ПЕРЕД темой, потому что в теме
+    часто стоит номер обращения, а не сам код.
+
+    Ссылка ищется последней и по сырому HTML, а не по очищенному: тег
+    <a href="..."> содержит URL в атрибуте, и вырезание тегов регуляркой
+    уничтожило бы его вместе с разметкой.
     """
-    plain, raw = [], []
     subject = msg.get("subject") or ""
-    if isinstance(subject, str):
-        plain.append(subject)
-        raw.append(subject)
+    if not isinstance(subject, str):
+        subject = ""
 
+    body_plain, body_raw = [], []
     for v in _parts(msg.get("text")):
-        plain.append(v)
-        raw.append(v)
-
+        body_plain.append(v)
+        body_raw.append(v)
     for v in _parts(msg.get("html")):
-        raw.append(v)
-        plain.append(re.sub(r"<[^>]+>", " ", v))
+        body_raw.append(v)
+        body_plain.append(re.sub(r"<[^>]+>", " ", v))
 
-    code_blob = "\n".join(plain)
-    url_blob = "\n".join(raw)
+    body = "\n".join(body_plain)
+    raw = "\n".join([subject] + body_raw)
 
-    m = CODE_LABELLED.search(code_blob) or CODE_RE.search(code_blob)
-    if m:
-        return m.group(1), None
-    m = URL_RE.search(url_blob)
+    for text in (body, subject):
+        found = _labelled_code(text)
+        if found:
+            return found, None
+
+    for text in (body, subject):
+        found = _digit_code(text)
+        if found:
+            return found, None
+
+    m = URL_RE.search(raw)
     if m:
         return None, m.group(0)
     return None, None

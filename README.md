@@ -65,17 +65,28 @@ sitting in the inbox is ignored.
 `wait` prints a verification code if it finds one, otherwise an activation
 link.
 
-Codes are matched in two passes:
+Codes are matched in two passes, and the **body is searched before the
+subject** — subjects usually carry a ticket number, not the code.
 
-1. **Labelled** — `code`, `код`, `pin`, `otp`, `verification`, `verify`,
-   `подтверж`, followed within 30 characters by 4–8 digits.
-2. **Any** — the first run of 4–8 digits anywhere in the message.
+1. **Labelled** — a marker word (`code`, `код`, `pin`, `otp`, `verification`,
+   `verify`, `passcode`, `пароль`, `token`) followed within 40 characters by a
+   candidate token. The token is accepted if it is 4–8 digits, or 4–10
+   characters containing both digits and letters — which is how `K3M9XP`
+   style codes get caught.
+2. **Any digits** — 4–8 consecutive digits, after separators *inside* a
+   number are removed, so `48 29 13` reads as `482913` and `1234-5678` as
+   `12345678`.
 
-Links are matched against the raw HTML and the plain-text parts.
+Links are matched against the raw HTML and the plain-text parts, and only
+after both code passes come up empty.
 
 Known limitation: an ordinary message containing unrelated numbers
 (`Order 99201 shipped`) will yield those numbers as the "code". This is a
 deliberate trade-off for a zero-dependency single file.
+
+Two more documented non-behaviours: a bare alphanumeric token in a subject
+with no marker word is not treated as a code, and runs longer than 8 digits
+are skipped.
 
 Known roughness: the poll loop sleeps 4 seconds, so `wait` can overrun its
 timeout by up to 4 seconds. Measured: `mailtmp wait 6` returned after 9
@@ -143,7 +154,7 @@ logic, including all three response shapes the API returns:
 python3 tests/test_extract.py
 ```
 
-19 tests. `TestApiShapes` encodes the real responses verbatim — including the
+33 tests. `TestApiShapes` encodes the real responses verbatim — including the
 one that caused bug 3.
 
 Live mail delivery is **not** covered by automated tests — sending SMTP mail
