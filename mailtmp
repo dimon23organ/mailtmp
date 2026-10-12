@@ -151,6 +151,10 @@ def cmd_inbox():
 
 def cmd_read(n):
     s = require_state()
+    if isinstance(n, (list, tuple)):
+        n = n[0] if n else ""
+    if not n:
+        die("нужен id письма — посмотри список: mailtmp inbox")
     items = api("GET", "/messages", token=s["token"])
     items = items.get("hydra:member") or items.get("member") or []
     match = next((i for i in items if i["id"].startswith(n)), None)
@@ -161,10 +165,36 @@ def cmd_read(n):
     print(f"Тема:  {msg.get('subject','')}")
     print(f"Дата:  {msg.get('createdAt','')}")
     print("-" * 60)
-    for part in msg.get("text") or []:
-        body = part.get("value") or part.get("text") or ""
-        if body.strip():
-            print(body[:4000])
+    body = "\n".join(v for v in _parts(msg.get("text")) if v.strip())
+    if not body.strip():
+        body = "\n".join(
+            re.sub(r"<[^>]+>", " ", v) for v in _parts(msg.get("html")) if v.strip()
+        )
+    if body.strip():
+        print(body[:4000])
+    else:
+        print("(пустое тело — вероятно, только вложения)")
+
+
+def _parts(value):
+    """Привести секцию письма к списку строк.
+
+    Формат ответа mail.tm неоднороден: `text` приходит строкой,
+    `html` — списком строк, а в части ответов секции уже разбиты
+    на список словарей с ключом 'value'. Нормализуем всё три варианта,
+    иначе на живом письке будет AttributeError.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    out = []
+    for item in value:
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            out.append(item.get("value") or item.get("text") or "")
+    return out
 
 
 def extract(msg):
@@ -176,16 +206,15 @@ def extract(msg):
     """
     plain, raw = [], []
     subject = msg.get("subject") or ""
-    plain.append(subject)
-    raw.append(subject)
+    if isinstance(subject, str):
+        plain.append(subject)
+        raw.append(subject)
 
-    for part in msg.get("text") or []:
-        v = part.get("value") or part.get("text") or ""
+    for v in _parts(msg.get("text")):
         plain.append(v)
         raw.append(v)
 
-    for part in msg.get("html") or []:
-        v = part.get("value") or ""
+    for v in _parts(msg.get("html")):
         raw.append(v)
         plain.append(re.sub(r"<[^>]+>", " ", v))
 

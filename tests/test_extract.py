@@ -113,5 +113,48 @@ class TestRobustness(unittest.TestCase):
         expect_code(self, text("Order 99201 shipped"), "99201")
 
 
+class TestApiShapes(unittest.TestCase):
+    """Реальный ответ mail.tm, а не предположение о нём.
+
+    На живом письме выяснилось: `text` приходит СТРОКОЙ, а `html` —
+    списком строк. Ранняя версия кода ждала список словарей с ключом
+    'value' и падала с AttributeError. Формат неоднороден, поэтому
+    покрыты все три варианта.
+    """
+
+    def test_text_as_plain_string(self):
+        # Ровно то, что вернул api.mail.tm на живом письме:
+        # subject="12312", text — строка, html — список строк.
+        # Ответ 12312, а НЕ 312312312315: тема разбирается первой,
+        # а 12 цифр подряд не подходят под \d{4,8} из-за границ слова.
+        expect_code(self, {"subject": "12312", "text": "312312312315",
+                           "html": ["<div dir=\"ltr\">312312312315</div>"]}, "12312")
+
+    def test_long_digit_run_is_not_a_code(self):
+        # 12 цифр подряд — это не код, ловить нечего.
+        code, url = extract({"subject": "тест", "text": "312312312315"})
+        self.assertIsNone(code)
+        self.assertIsNone(url)
+
+    def test_html_as_list_of_strings(self):
+        expect_link(self, {"subject": "Go",
+                           "html": ["<a href=\"https://ex.com/x\">go</a>"]},
+                    "https://ex.com/x")
+
+    def test_sections_as_list_of_dicts(self):
+        # другой вариант того же ответа
+        expect_code(self, {"subject": "", "text": [{"value": "код 4455"}]}, "4455")
+
+    def test_mixed_shapes(self):
+        expect_code(self, {"subject": "Code 7788",
+                           "text": "ignored",
+                           "html": [{"value": "<p>ignored</p>"}]}, "7788")
+
+    def test_non_string_subject_ignored(self):
+        code, url = extract({"subject": ["x"], "text": "abc"})
+        self.assertIsNone(code)
+        self.assertIsNone(url)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
