@@ -29,6 +29,7 @@ import urllib.request
 API = "https://api.mail.tm"
 STATE_DIR = os.path.expanduser("~/.local/state/mailtmp")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
+POLL_SEC = 4.0  # пауза между опросами inbox в wait
 
 # --- Шаблоны поиска кода -------------------------------------------------
 #
@@ -296,11 +297,18 @@ def cmd_wait(seconds=90):
     deadline = time.time() + int(seconds)
     sys.stderr.write(f"жду новое письмо на {s['address']} (до {seconds} с)…\n")
     while time.time() < deadline:
-        time.sleep(4)
         items = api("GET", "/messages", token=s["token"])
         items = items.get("hydra:member") or items.get("member") or []
         fresh = [i for i in items if i["id"] not in seen]
         if not fresh:
+            # Спим не дольше остатка до дедлайна. Раньше стоял безусловный
+            # sleep(4) ПОСЛЕ проверки, поэтому wait возвращался позже
+            # таймаута на величину последнего сна: `wait 6` → 9 секунд.
+            # Первая проверка теперь тоже идёт сразу, а не через 4 секунды.
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(POLL_SEC, remaining))
             continue
         fresh.sort(key=lambda i: i.get("createdAt", ""), reverse=True)
         for i in fresh:

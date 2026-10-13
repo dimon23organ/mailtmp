@@ -88,9 +88,11 @@ Two more documented non-behaviours: a bare alphanumeric token in a subject
 with no marker word is not treated as a code, and runs longer than 8 digits
 are skipped.
 
-Known roughness: the poll loop sleeps 4 seconds, so `wait` can overrun its
-timeout by up to 4 seconds. Measured: `mailtmp wait 6` returned after 9
-seconds with exit code 2.
+The poll loop sleeps at most 4 seconds, and never past the deadline, so
+`wait` returns close to when it was told to. Measured on the same account:
+`mailtmp wait 6` took 8.9 s before the fix and 6.3 s after — the 0.3 s
+remainder is one API round trip. The inbox is also polled immediately on
+start rather than after a first 4-second pause.
 
 ## Where state lives
 
