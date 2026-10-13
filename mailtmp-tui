@@ -149,6 +149,24 @@ def unicodedata_wide(ch):
     return unicodedata.east_asian_width(ch) in ("W", "F")
 
 
+def wrap_addr(addr, width):
+    """Разбивает адрес по точкам, чтобы длинный не обрезался молча.
+
+    Адрес нельзя копировать из части строки: часть — это другой адрес.
+    Поэтому показываем его целиком, пусть в несколько строк.
+    """
+    if not addr:
+        return ["(нет)"]
+    if len(addr) <= width:
+        return [addr]
+    parts = addr.split("@")
+    if len(parts) == 2 and len(parts[0]) > width:
+        head = parts[0]
+        lines = [head[i:i + width] for i in range(0, len(head), width)]
+        return lines + ["@" + parts[1]]
+    return [addr]
+
+
 class Panel:
     """Три прямоугольника: сайдбар, список, чтение."""
 
@@ -343,6 +361,19 @@ class App:
         else:
             self.focus = "list"
 
+    def copy_address(self):
+        """Копирует текущий адрес — его надо вставлять в форму регистрации."""
+        addr = core.load_state().get("address")
+        if not addr:
+            self.note("адреса нет — нажми N, чтобы создать", "error")
+            return
+        if not shutil.which("wl-copy"):
+            self.note("wl-copy нет: адрес %s" % addr, "error")
+            return
+        subprocess.run(["wl-copy"], input=addr.encode(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.note("адрес скопирован: %s" % addr, "good")
+
     def toggle_star(self):
         item = self.current()
         if not item:
@@ -480,6 +511,17 @@ class App:
                 self.put(y, x0 + 1, mark)
             y += 1
         y += 1
+        self.put(y, x0 + 2, "АДРЕС", curses.A_BOLD, w)
+        y += 2
+        # Адрес видно здесь постоянно, а не только в правом углу верхней
+        # полосы: после N новый адрес там легко пропустить, а скопировать
+        # его оттуда нечем. Именно на это жаловались.
+        addr = core.load_state().get("address") or "(нет — нажми N)"
+        for line in wrap_addr(addr, w):
+            self.put(y, x0 + 2, pad(line, w), curses.A_BOLD, w)
+            y += 1
+        self.put(y, x0 + 2, "y  копировать", curses.A_DIM, w)
+        y += 2
         self.put(y, x0 + 2, "СОСТОЯНИЕ", curses.A_BOLD, w)
         y += 2
         stats = [
@@ -613,8 +655,8 @@ class App:
             keys = "ждать %d с   r обновить   Esc отмена" % left
         else:
             keys = ("↑↓ выбор  Enter открыть  u назад  n ждать  N новый адрес  "
-                    "r обновить  d удалить  s звезда  / поиск  Tab панель  "
-                    "A авто  ? помощь  q выход")
+                    "r обновить  d удалить  s звезда  c код  y адрес  "
+                    "/ поиск  Tab панель  A авто  ? помощь  q выход")
             if self.auto:
                 keys = "авто-обновление каждые %.0f с   " % self.poll + keys
         self.put(h - 1, 0, pad(clip(keys, w - 1), w - 1), curses.A_DIM, w)
@@ -655,6 +697,7 @@ class App:
         rows.append(("Аккаунт", ""))
         rows.extend([
             ("N", "новый адрес"),
+            ("y", "скопировать адрес в буфер"),
             ("r", "обновить inbox"),
             ("A", "включить авто-обновление"),
             ("?", "эта помощь"),
@@ -746,6 +789,9 @@ class App:
             return
         if ch == ord("s"):
             self.toggle_star()
+            return
+        if ch == ord("y"):
+            self.copy_address()
             return
         if ch == ord("c"):
             if self.search:

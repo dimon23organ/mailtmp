@@ -290,6 +290,69 @@ class Layout(unittest.TestCase):
         self.assertLessEqual(len(self.mod.clip("длинный текст", 5)), 5)
 
 
+class Address(unittest.TestCase):
+    """Адрес обязан быть виден и копируем, иначе его не вставить в форму."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_tui()
+        cls.mod.UI_STATE = STATE
+
+    def setUp(self):
+        if STATE.exists():
+            STATE.unlink()
+        self.app = make_app(self.mod)
+
+    def sidebar_text(self):
+        return "\n".join(t for _, _, t, _ in self.app.scr.drawn)
+
+    def test_address_visible_in_sidebar(self):
+        self.app.sidebar()
+        text = self.sidebar_text()
+        self.assertIn("АДРЕС", text)
+        self.assertIn("demo@maxxspace.com", text)
+
+    def test_address_copied_to_clipboard(self):
+        calls = []
+        real = self.mod.subprocess.run
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw.get("input")))
+            return real.__self__.CompletedProcess(cmd, 0, b"", b"") \
+                if hasattr(real, "__self__") else None
+
+        self.mod.shutil.which = lambda name: "/usr/sbin/wl-copy"
+        self.mod.subprocess.run = lambda cmd, **kw: calls.append(
+            (cmd, kw.get("input"))) or type("R", (), {"returncode": 0})()
+        try:
+            self.app.handle(ord("y"))
+        finally:
+            self.mod.subprocess.run = real
+        self.assertEqual(len(calls), 1, "wl-copy не вызван")
+        cmd, payload = calls[0]
+        self.assertEqual(cmd, ["wl-copy"])
+        self.assertEqual(payload, b"demo@maxxspace.com")
+        self.assertEqual(self.app.status_kind, "good")
+
+    def test_y_without_address_says_so(self):
+        self.mod.core.load_state = lambda: {}
+        try:
+            self.app.handle(ord("y"))
+        finally:
+            self.mod.core.load_state = lambda: {"address": "demo@maxxspace.com"}
+        self.assertEqual(self.app.status_kind, "error")
+
+    def test_long_address_is_wrapped_not_cut(self):
+        long = "abcdefghij" * 5 + "@maxxspace.com"
+        lines = self.mod.wrap_addr(long, 20)
+        self.assertGreater(len(lines), 1)
+        joined = "".join(lines)
+        self.assertEqual(joined.replace("@", ""), long.replace("@", ""),
+                         "адрес потерялся при переносе")
+        for line in lines:
+            self.assertLessEqual(len(line), 24)
+
+
 class Help(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

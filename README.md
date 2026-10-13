@@ -70,7 +70,7 @@ Three panes, like a normal mail client:
 | `d` / `s` | delete / star |
 | `c` | copy the code to the clipboard |
 | `n` | wait for a new message, with a countdown |
-| `N` | new address |
+| `N` / `y` | new address / copy the address |
 | `r` / `A` | refresh / auto-refresh |
 | `/` / `c` | search / clear search |
 | `Tab` / `1` `2` `3` | switch pane |
@@ -82,6 +82,11 @@ separate from `state.json` — the core rewrites that file wholesale on
 
 The client does not reimplement message parsing: it imports this script
 as a module and uses `extract()` as is.
+
+The current address is always visible in the sidebar — not only in the
+corner of the title bar, where a freshly created one is easy to miss — and
+`y` copies it to the clipboard, which is what you actually want when
+pasting it into a signup form.
 
 ## Commands
 
