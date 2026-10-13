@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""mailtmp-tui — терминальный интерфейс к mailtmp.
+
+Живёт рядом с основным скриптом и НЕ копирует его логику: модуль
+`mailtmp` импортируется, если он импортируется вообще. Поэтому код
+извлечения кодов и работа с API остаются в одном месте, а не
+расходятся между CLI и TUI.
+
+Запуск:
+    mailtmp-tui            — адрес есть в state.json
+    mailtmp-tui new        — сначала создать адрес
+
+Клавиши (tmux-стиль, но без префикса):
+    ↑ ↓          список писем
+    Enter        открыть письмо
+    n            новый адрес
+    r            обновить (перечитать inbox)
+    d            удалить письмо
+    c            скопировать код/ссылку письма в буфер
+    s            настройки (интервал опроса, авто-обновление)
+    w            ждать новое письмо с таймером
+    q            выход
+
+Зависимостей нет: только стандартная библиотека Python 3, включая
+curses. Внешние пакеты (`curses`, `urwid`, `prompt_toolkit`) не нужны
+и на этой машине не стоят.
+"""
+
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CORE = HERE / "mailtmp"
+
+POLL_MIN = 1
+POLL_MAX = 120
+
+
+def load_core():
+    """Подгружает одноимённый модуль из соседнего файла.
+
+    Имя `mailtmp` не совпадает с `mailtmp-tui`, поэтому обычный import
+    не сработает. Берём путь явно — тогда работает и `python3
+    mailtmp-tui`, и запуск из любого каталога.
+    """
+    if not CORE.exists():
+        sys.stderr.write("mailtmp-tui: не найден %s\n" % CORE)
+        sys.exit(1)
+    spec = importlib.util.spec_from_loader(
+        "mailtmp_core",
+        importlib.machinery.SourceFileLoader("mailtmp_core", str(CORE)),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    # execute_module выполнит весь файл, включая блок под __main__.
+    # Поэтому подменяем __name__: при "mailtmp_core" условие не сработает
+    # и argparse не запустится.
+    spec.loader.exec_module(mod)
+    return mod
+
+
+core = load_core()
+
+
+def load_breaks(mod):
+    """Достаёт команды из докстринга cli-скрипта.
+
+    Второй источник правды заводить нельзя, поэтому читаем тот же
+    __doc__. Формат там такой:
+
+        mailtmp new              новый адрес, запомнить его
+
+    Первое слово — команда, остальное — описание. Возвращает список
+    кортежей (команда, описание).
+    """
+    keys = []
+    seen = set()
+    for line in (mod.__doc__ or "").splitlines():
+        line = line.strip()
+        if not line.startswith("mailtmp "):
+            continue
+        parts = line.split(None, 2)
+        # parts[0] — это «mailtmp», сама команда в parts[1].
+        name = parts[1] if len(parts) > 1 else ""
+        if not name or name in seen or not re.match(r"^[a-z]", name):
+            continue
+        desc = parts[2].strip() if len(parts) > 2 else ""
+        seen.add(name)
+        keys.append((name, desc))
+    return keys
+
+
+class App:
+    def __init__(self, stdscr, want_new=False):
+        self.scr = stdscr
+        self.state = {}
+        self.items = []
+        self.cursor = 0
+        self.top = 0
+        self.view = "list"          # list | read | help | wait
+        self.message = ""
+        self.message_kind = "info"  # info | error | good
+        self.body = []
+        self.read_id = None
+        self.poll = 5.0
+        self.auto = False
+        self.last_poll = 0.0
+        self.wait_until = 0.0
+        self.seen = set()
+        self.quit = False
+        if want_new:
+            self.new_address()
+        else:
+            self.reload_state()
+            self.poll_inbox()
+
+    # ------------------------------------------------------------ состояние
+
+    def reload_state(self):
+        self.state = core.load_state()
+
+    @property
+    def address(self):
+        return self.state.get("address") or ""
+
+    def note(self, text, kind="info"):
+        self.message = text
+        self.message_kind = kind
+
+    # ---------------------------------------------------------------- сеть
+
+    def poll_inbox(self):
+        if not self.address:
+            self.items = []
+            return
+        try:
+            data = core.api("GET", "/messages", token=self.state["token"])
+        except SystemExit:
+            # api() зовёт die(), а тот делает sys.exit — ловим и
+            # показываем в интерфейсе, а не убиваем TUI.
+            self.note("не смог получить inbox", "error")
+            self.items = []
+            return
+        except Exception as exc:                       # noqa: BLE001
+            self.note("сеть: %s" % exc, "error")
+            return
+        self.items = data.get("hydra:member") or data.get("member") or []
+        self.items.sort(key=lambda i: i.get("createdAt", ""), reverse=True)
+        fresh = [i for i in self.items if i["id"] not in self.seen]
+        if fresh and self.seen:
+            self.note("новых писем: %d" % len(fresh), "good")
+        self.seen.update(i["id"] for i in self.items)
+        self.last_poll = time.monotonic()
+
+    def new_address(self):
+        try:
+            domains = core.api("GET", "/domains")
+        except SystemExit:
+            self.note("сервис недоступен", "error")
+            return
+        items = [i for i in (domains.get("hydra:member") or domains.get("member") or [])
+                 if i.get("isActive", True)]
+        if not items:
+            self.note("нет активных доменов", "error")
+            return
+        domain = core.random.SystemRandom().choice(items)["domain"]
+        address = "%s@%s" % (core.random_name(), domain)
+        password = core.random_pw()
+        try:
+            core.api("POST", "/accounts", {"address": address, "password": password})
+            token = core.api("POST", "/token",
+                             {"address": address, "password": password}).get("token")
+        except SystemExit:
+            self.note("не удалось создать адрес", "error")
+            return
+        if not token:
+            self.note("сервис не вернул токен", "error")
+            return
+        core.save_state({"address": address, "password": password, "token": token})
+        self.reload_state()
+        self.seen.clear()
+        self.poll_inbox()
+        self.note("новый адрес: %s" % address, "good")
+
+    def fetch_body(self, mid):
+        try:
+            return core.api("GET", "/messages/%s" % mid, token=self.state["token"])
+        except SystemExit:
+            self.note("не смог открыть письмо", "error")
+            return None
+
+    # ------------------------------------------------------------- действия
+
+    def open_selected(self):
+        if not self.items:
+            self.note("письмо не выбрано", "error")
+            return
+        msg = self.fetch_body(self.items[self.cursor]["id"])
+        if msg is None:
+            return
+        self.read_id = self.items[self.cursor]["id"]
+        code, url = core.extract(msg)
+        frm = (msg.get("from") or {}).get("address", "?")
+        lines = [
+            "От:    %s" % frm,
+            "Тема:  %s" % (msg.get("subject") or "(без темы)"),
+            "Дата:  %s" % (msg.get("createdAt") or "")[:19],
+            "",
+        ]
+        if code:
+            lines.append("КОД:   %s" % code)
+        if url:
+            lines.append("ССЫЛКА: %s" % url)
+        if not code and not url:
+            lines.append("(код и ссылка не найдены)")
+        lines.append("")
+        lines.append("-" * 60)
+        body = []
+        for v in core._parts(msg.get("text")):
+            body.extend(v.splitlines())
+        if not body:
+            for v in core._parts(msg.get("html")):
+                body.extend(re.sub(r"<[^>]+>", " ", v).splitlines())
+        lines.extend(body or ["(пустое письмо)"])
+        self.body = lines
+        self.view = "read"
+        self.cursor_body = 0
+
+    def delete_selected(self):
+        if not self.items:
+            return
+        item = self.items[self.cursor]
+        try:
+            core.api("DELETE", "/messages/%s" % item["id"], token=self.state["token"])
+        except SystemExit:
+            self.note("не удалось удалить", "error")
+            return
+        self.note("письмо удалено", "good")
+        self.poll_inbox()
+
+    def copy_selected(self):
+        """Копирует код или ссылку письма. wl-copy может не быть."""
+        if not self.items:
+            return
+        msg = self.fetch_body(self.items[self.cursor]["id"])
+        if msg is None:
+            return
+        code, url = core.extract(msg)
+        text = code or url
+        if not text:
+            self.note("в письме нет ни кода, ни ссылки", "error")
+            return
+        import shutil
+        import subprocess
+        if shutil.which("wl-copy"):
+            subprocess.run(["wl-copy"], input=text.encode(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.note("скопировано: %s" % text, "good")
+            return
+        # Без wl-copy показываем текст — его можно выделить вручную.
+        self.view = "read"
+        self.body = ["Нет wl-copy, скопируй вручную:", "", text]
+        self.note("wl-copy не найден — показано на экране", "error")
+
+    # ------------------------------------------------------------- отрисовка
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        add = self.scr.addstr
+
+        title = "mailtmp-tui"
+        add(0, 0, title.ljust(w - 1)[: w - 1], curses.A_REVERSE)
+        add(1, 0, (" %s " % (self.address or "адреса нет — нажми n")).ljust(w - 1)[: w - 1])
+
+        # Область содержимого (строки 2..h-3) затираем ДО отрисовки:
+        # erase() помечает экран пустым, но там, где в прошлом кадре были
+        # длинные строки списка, без явной затирки остаются хвосты —
+        # это и портило переход в справку.
+        blank = " " * (w - 1)
+        for y in range(2, max(2, h - 3)):
+            try:
+                add(y, 0, blank)
+            except curses.error:
+                pass
+
+        if self.view == "read":
+            self.draw_read(h, w)
+        elif self.view == "help":
+            self.draw_help(h, w)
+        elif self.view == "wait":
+            self.draw_wait(h, w)
+        else:
+            self.draw_list(h, w)
+
+        if self.message:
+            attr = curses.A_BOLD
+            if self.message_kind == "error":
+                attr |= curses.A_REVERSE
+            add(h - 2, 0, (" " + self.message)[: w - 1].ljust(w - 1), attr)
+
+        add(h - 1, 0, self.hint(h, w)[: w - 1].ljust(w - 1), curses.A_DIM)
+        self.scr.noutrefresh()
+        curses.doupdate()
+
+    def hint(self, h, w):
+        if self.view == "read":
+            return "↑↓ прокрутка   c копировать   r обновить   Esc назад   q выход"
+        if self.view == "wait":
+            return "ждать осталось %d с…   r обновить   Esc отмена   q выход" % max(
+                0, int(self.wait_until - time.monotonic()))
+        return ("↑↓ выбор   Enter открыть   n новый адрес   r обновить   "
+                "d удалить   c код   w ждать   ? помощь   q выход")
+
+    def draw_list(self, h, w):
+        add = self.scr.addstr
+        if not self.items:
+            add(3, 2, "Писем нет.", curses.A_BOLD)
+            add(4, 2, "Отправьте что-нибудь на адрес выше, или нажмите r.")
+            return
+        rows = h - 5
+        if self.cursor < self.top:
+            self.top = self.cursor
+        if self.cursor >= self.top + rows:
+            self.top = self.cursor - rows + 1
+        add(3, 0, " %-8s %-19s %-30s %s" % ("id", "когда", "от кого", "тема"))
+        for row in range(rows):
+            idx = self.top + row
+            if idx >= len(self.items):
+                break
+            it = self.items[idx]
+            frm = (it.get("from") or {}).get("address", "?")
+            line = " %-8s %-19s %-30s %s" % (
+                it["id"][:8], (it.get("createdAt") or "")[:19],
+                frm[:30], (it.get("subject") or "")[: max(0, w - 62)])
+            attr = curses.A_REVERSE if idx == self.cursor else curses.A_NORMAL
+            add(4 + row, 0, line[: w - 1].ljust(w - 1), attr)
+        add(h - 3, 0, ("всего %d, показано с %d   опрос: %s"
+                       % (len(self.items), self.top + 1,
+                          ("%.0f с, авто" % self.poll) if self.auto else "вручную"))[: w - 1],
+            curses.A_DIM)
+
+    def draw_read(self, h, w):
+        add = self.scr.addstr
+        rows = h - 5
+        for row in range(rows):
+            idx = getattr(self, "cursor_body", 0) + row
+            if idx >= len(self.body):
+                break
+            add(3 + row, 0, self.body[idx][: w - 1].ljust(w - 1))
+        total = len(self.body)
+        shown = min(rows, total)
+        add(h - 3, 0, ("строка %d из %d" % (getattr(self, "cursor_body", 0) + 1, total))[: w - 1],
+            curses.A_DIM)
+
+    def draw_help(self, h, w):
+        add = self.scr.addstr
+        rows = h - 7
+        cmds = load_breaks(core)
+        add(3, 2, "Команды mailtmp", curses.A_BOLD)
+        for i, (name, desc) in enumerate(cmds[:rows]):
+            add(4 + i, 2, ("  %-10s %s" % (name, desc))[: w - 3])
+        nxt = 5 + min(len(cmds), rows)
+        if nxt < h - 5:
+            add(nxt, 2, "Плюс в этом интерфейсе:", curses.A_BOLD)
+            add(nxt + 1, 2, "  ↑↓ выбор, Enter открыть, n новый адрес, r обновить,")
+            add(nxt + 2, 2, "  d удалить письмо, c скопировать код, s авто-обновление,")
+            add(nxt + 3, 2, "  w ждать новое письмо, ? эта справка, q выход")
+
+    def draw_wait(self, h, w):
+        add = self.scr.addstr
+        left = max(0, int(self.wait_until - time.monotonic()))
+        add(3, 4, "Жду новое письмо на %s" % self.address)
+        add(4, 4, "осталось %d с" % left)
+        add(5, 4, "тик. " * (left // 10 + 1))
+        add(6, 4, "уже в inbox: %d" % len(self.items))
+
+    # ---------------------------------------------------------------- цикл
+
+    def tick(self):
+        now = time.monotonic()
+        if self.view == "wait":
+            if now >= self.wait_until:
+                before = len(self.items)
+                self.poll_inbox()
+                if len(self.items) > before:
+                    self.open_selected()
+                    self.note("письмо пришло", "good")
+                else:
+                    self.view = "list"
+                    self.note("время вышло, новых писем нет", "error")
+            return
+        if self.auto and now - self.last_poll >= self.poll:
+            self.poll_inbox()
+
+    def loop(self):
+        curses.curs_set(0)
+        self.scr.keypad(True)
+        while not self.quit:
+            self.tick()
+            self.draw()
+            try:
+                ch = self.scr.getch()
+            except KeyboardInterrupt:
+                break
+            self.handle(ch)
+
+    def handle(self, ch):
+        h, w = self.scr.getmaxyx()
+        if self.view == "read":
+            self.handle_read(ch, h)
+            return
+        if self.view == "wait":
+            if ch in (27, ord("q")):
+                self.view = "list"
+            elif ch == ord("r"):
+                self.poll_inbox()
+            return
+
+        if ch in (ord("q"), 27):
+            self.quit = True
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            if self.items and self.cursor < len(self.items) - 1:
+                self.cursor += 1
+        elif ch in (curses.KEY_UP, ord("k")):
+            if self.cursor > 0:
+                self.cursor -= 1
+        elif ch in (curses.KEY_NPAGE,):
+            self.cursor = min(len(self.items) - 1, self.cursor + max(1, h - 6))
+        elif ch in (curses.KEY_PPAGE,):
+            self.cursor = max(0, self.cursor - max(1, h - 6))
+        elif ch in (ord("g"),):
+            self.cursor = 0
+        elif ch in (ord("G"),):
+            self.cursor = max(0, len(self.items) - 1)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            self.open_selected()
+        elif ch == ord("n"):
+            self.new_address()
+        elif ch == ord("r"):
+            self.poll_inbox()
+            self.note("обновлено: %d писем" % len(self.items), "good")
+        elif ch == ord("d"):
+            self.delete_selected()
+        elif ch == ord("c"):
+            self.copy_selected()
+        elif ch == ord("w"):
+            self.view = "wait"
+            self.wait_until = time.monotonic() + 90
+            self.seen.clear()
+        elif ch == ord("?"):
+            self.view = "help"
+        elif ch == ord("s"):
+            self.auto = not self.auto
+            self.note("авто-обновление: %s" % ("вкл" if self.auto else "выкл"), "good")
+
+    def handle_read(self, ch, h):
+        total = max(1, len(self.body))
+        page = max(1, h - 6)
+        if ch in (27, ord("q")):
+            self.view = "list"
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor_body = min(total - 1, getattr(self, "cursor_body", 0) + 1)
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.cursor_body = max(0, getattr(self, "cursor_body", 0) - 1)
+        elif ch == curses.KEY_NPAGE:
+            self.cursor_body = min(total - 1, getattr(self, "cursor_body", 0) + page)
+        elif ch == curses.KEY_PPAGE:
+            self.cursor_body = max(0, getattr(self, "cursor_body", 0) - page)
+        elif ch in (curses.KEY_HOME, ord("g")):
+            self.cursor_body = 0
+        elif ch == ord("c"):
+            self.copy_selected()
+        elif ch == ord("r"):
+            self.poll_inbox()
+            self.note("обновлено", "good")
+        elif ch == ord("n"):
+            self.view = "list"
+            self.new_address()
+
+
+def main():
+    want_new = len(sys.argv) > 1 and sys.argv[1] == "new"
+    st = core.load_state()
+    if not want_new and not st.get("address"):
+        want_new = True
+    try:
+        curses.wrapper(lambda s: App(s, want_new).loop())
+    except KeyboardInterrupt:
+        pass
+    print("адрес: %s" % core.load_state().get("address", "(нет)"))
+
+
+if __name__ == "__main__":
+    main()
