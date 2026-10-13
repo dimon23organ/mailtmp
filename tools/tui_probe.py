@@ -239,9 +239,6 @@ def main():
         except OSError:
             pass
 
-    for key in KEYS:
-        send(key)
-
     chunks = []
     first = drain(2.5)  # запуск, первый кадр
     # smkx = ESC [ ? 1 h — терминал переведён в прикладной режим.
