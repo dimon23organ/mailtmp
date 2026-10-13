@@ -7,6 +7,8 @@ mailtmp — временная почта для регистраций, пов�
 реально принимающий адрес без своей инфраструктуры.
 
 Команды:
+    mailtmp                  открыть терминальный клиент (как gmail, но в tui)
+    mailtmp tui [new]        то же явно; с new — сначала создать адрес
     mailtmp new              новый адрес, запомнить его
     mailtmp addr             показать текущий адрес
     mailtmp domains          какие домены доступны сейчас
@@ -340,6 +342,30 @@ def usage():
     sys.exit(2)
 
 
+def cmd_tui(args):
+    """Открыть терминальный клиент из соседнего файла.
+
+    Клиент лежит рядом отдельным файлом и сам себя грузит: дублировать
+    разбор писем здесь нельзя, extract() уже отлажен на четырёх багах.
+    Если соседа нет (например, установлен только этот файл), откатываемся
+    на справку вместо отказа.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "mailtmp-tui")
+    if not os.path.exists(path):
+        die("не найден %s — клиент не установлен. Поставь рядом с mailtmp." % path)
+    loader = importlib.machinery.SourceFileLoader("mailtmp_tui", path)
+    spec = importlib.util.spec_from_loader("mailtmp_tui", loader)
+    mod = importlib.util.module_from_spec(spec)
+    # Имя модуля не "__main__", поэтому клиент не запустит main() сам.
+    loader.exec_module(mod)
+    mod.main()
+    return 0
+
+
 COMMANDS = {
     "new": lambda a: cmd_new(),
     "addr": lambda a: cmd_addr(),
@@ -348,10 +374,19 @@ COMMANDS = {
     "read": cmd_read,
     "wait": lambda a: cmd_wait(a[0] if a else 90),
     "reset": lambda a: cmd_reset(),
+    "tui": cmd_tui,
 }
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+    if len(sys.argv) < 2:
+        # Без аргументов — клиент, но только когда есть терминал:
+        # в скрипте или пайпе `mailtmp` без единого аргумента должен
+        # показать справку, а не висеть в curses.
+        if sys.stdout.isatty() and sys.stdin.isatty():
+            cmd_tui([])
+        else:
+            usage()
+    if sys.argv[1] in ("-h", "--help", "help"):
         usage()
     fn = COMMANDS.get(sys.argv[1])
     if not fn:

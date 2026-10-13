@@ -32,14 +32,63 @@ Requires Python 3.6+ and nothing else.
 ```bash
 git clone <this-repo>
 install -m 755 mailtmp ~/.local/bin/
+install -m 755 mailtmp-tui ~/.local/bin/
 ```
 
-Make sure `~/.local/bin` is on your `PATH`.
+Both files are needed: `mailtmp-tui` is the client, `mailtmp` is its
+backend and it loads the client by path. Make sure `~/.local/bin` is on
+your `PATH`.
+
+## The TUI client
+
+```bash
+mailtmp            # open the client (same as `mailtmp tui`)
+mailtmp tui new    # create an address first, then open it
+```
+
+Typing `mailtmp` with no arguments opens the client — the mailprogram of
+this tool. When stdout is not a terminal (a pipe, a script, CI), it prints
+the usage text instead of hanging in curses.
+
+Three panes, like a normal mail client:
+
+```
+┌──────────┐┌──────────────────┐┌───────────────────────────┐
+│ ПОЧТА    ││ Входящие — 5     ││ От:    noreply@github.com│
+│ Входящие ││  ★●from  10-13   ││ Тема:  Your code         │
+│ ★        ││     subject      ││                           │
+│ ОТПРАВКА ││  ●from2  10-13   ││ КОД: 731294               │
+│ Черновик ││     subject      ││                           │
+└──────────┘└──────────────────┘└───────────────────────────┘
+```
+
+| Key | |
+|---|---|
+| `↑ ↓ j k` | select message |
+| `Enter` | open in the reading pane |
+| `u` | back to the list |
+| `d` / `s` | delete / star |
+| `c` | copy the code to the clipboard |
+| `n` | wait for a new message, with a countdown |
+| `N` | new address |
+| `r` / `A` | refresh / auto-refresh |
+| `/` / `c` | search / clear search |
+| `Tab` / `1` `2` `3` | switch pane |
+| `?` / `q` | help / quit |
+
+Stars and read markers are kept in `~/.local/state/mailtmp-tui.json`,
+separate from `state.json` — the core rewrites that file wholesale on
+`mailtmp new`, so anything stored there would be wiped.
+
+The client does not reimplement message parsing: it imports this script
+as a module and uses `extract()` as is.
 
 ## Commands
 
 | Command | Does |
 |---|---|
+| `mailtmp` | open the TUI client |
+| `mailtmp tui [new]` | the same, explicitly |
 | `mailtmp new` | Create a new address and remember it |
 | `mailtmp addr` | Print the current address |
 | `mailtmp domains` | List domains available right now |

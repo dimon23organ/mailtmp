@@ -27,7 +27,7 @@ import fcntl
 
 CMD = sys.argv[1] if len(sys.argv) > 1 else "q"
 KEYS = sys.argv[2:] or ["q"]
-ROWS, COLS = 30, 100
+ROWS, COLS = 34, 150
 
 
 def strip_ansi(data):

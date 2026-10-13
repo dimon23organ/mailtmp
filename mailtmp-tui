@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-"""mailtmp-tui — терминальный интерфейс к mailtmp.
+"""mailtmp — терминальный почтовый клиент поверх публичного API mail.tm.
 
-Живёт рядом с основным скриптом и НЕ копирует его логику: модуль
-`mailtmp` импортируется, если он импортируется вообще. Поэтому код
-извлечения кодов и работа с API остаются в одном месте, а не
-расходятся между CLI и TUI.
+Трёхпанельная раскладка, как в обычной почте: сайдбар слева, список
+писем в середине, чтение справа. Переключение панелей — Tab.
 
 Запуск:
-    mailtmp-tui            — адрес есть в state.json
-    mailtmp-tui new        — сначала создать адрес
+    mailtmp                открыть клиент (если адрес уже есть)
+    mailtmp tui            то же самое явно
+    mailtmp tui new        сначала создать адрес, потом открыть
 
-Клавиши (tmux-стиль, но без префикса):
-    ↑ ↓          список писем
-    Enter        открыть письмо
-    n            новый адрес
-    r            обновить (перечитать inbox)
+Клавиши:
+    ↑ ↓ j k      список писем
+    Enter        открыть письмо в панели чтения
+    u            вернуться к списку
+    n            ждать новое письмо с обратным отсчётом
+    N            создать новый адрес
+    r            обновить inbox
     d            удалить письмо
-    c            скопировать код/ссылку письма в буфер
-    s            настройки (интервал опроса, авто-обновление)
-    w            ждать новое письмо с таймером
+    s            отметить/снять звезду
+    /            поиск по теме и отправителю
+    c            очистить поиск
+    Tab          следующая панель
+    1 2 3        выбрать панель: сайдбар, список, чтение
+    ?            помощь
     q            выход
 
 Зависимостей нет: только стандартная библиотека Python 3, включая
-curses. Внешние пакеты (`curses`, `urwid`, `prompt_toolkit`) не нужны
-и на этой машине не стоят.
+curses. Внешние пакеты не нужны и на этой машине не стоят.
+
+Логику разбора писем клиент НЕ дублирует: соседний файл mailtmp
+загружается как модуль и используется как есть. Иначе extract(),
+отлаженный на четырёх багах, со временем разошёлся бы с оригиналом.
 """
 
 import curses
@@ -32,132 +39,229 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CORE = HERE / "mailtmp"
 
-POLL_MIN = 1
-POLL_MAX = 120
+# Состояние интерфейса живёт ОТДЕЛЬНО от state.json ядра: core.save_state()
+# перезаписывает state.json целиком, поэтому звёзды и прочее, положенные
+# туда, исчезли бы при каждом `mailtmp new`.
+UI_STATE = Path(os.path.expanduser("~/.local/state/mailtmp-tui.json"))
+
+POLL_DEFAULT = 5.0
+SIDEBAR_W = 22
+LIST_MIN = 30
+POLL_MIN, POLL_MAX = 1, 300
 
 
 def load_core():
-    """Подгружает одноимённый модуль из соседнего файла.
+    """Подгружает соседний mailtmp как модуль.
 
-    Имя `mailtmp` не совпадает с `mailtmp-tui`, поэтому обычный import
-    не сработает. Берём путь явно — тогда работает и `python3
-    mailtmp-tui`, и запуск из любого каталога.
+    Имя `mailtmp` совпадает с самим скриптом, поэтому обычный import не
+    годится. Путь берём явно — тогда работает запуск из любого каталога.
     """
     if not CORE.exists():
-        sys.stderr.write("mailtmp-tui: не найден %s\n" % CORE)
+        sys.stderr.write("mailtmp: не найден %s\n" % CORE)
         sys.exit(1)
-    spec = importlib.util.spec_from_loader(
-        "mailtmp_core",
-        importlib.machinery.SourceFileLoader("mailtmp_core", str(CORE)),
-    )
+    loader = importlib.machinery.SourceFileLoader("mailtmp_core", str(CORE))
+    spec = importlib.util.spec_from_loader("mailtmp_core", loader)
     mod = importlib.util.module_from_spec(spec)
-    # execute_module выполнит весь файл, включая блок под __main__.
-    # Поэтому подменяем __name__: при "mailtmp_core" условие не сработает
+    # Имя модуля не "mailtmp", поэтому блок под __main__ не сработает
     # и argparse не запустится.
-    spec.loader.exec_module(mod)
+    loader.exec_module(mod)
     return mod
 
 
 core = load_core()
 
 
-def load_breaks(mod):
-    """Достаёт команды из докстринга cli-скрипта.
-
-    Второй источник правды заводить нельзя, поэтому читаем тот же
-    __doc__. Формат там такой:
-
-        mailtmp new              новый адрес, запомнить его
-
-    Первое слово — команда, остальное — описание. Возвращает список
-    кортежей (команда, описание).
-    """
-    keys = []
-    seen = set()
-    for line in (mod.__doc__ or "").splitlines():
-        line = line.strip()
-        if not line.startswith("mailtmp "):
+def cli_commands():
+    """Достаёт команды из докстринга ядра — второй источник правды не заводим."""
+    out, seen = [], set()
+    for line in (core.__doc__ or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2 or parts[0] != "mailtmp":
             continue
-        parts = line.split(None, 2)
-        # parts[0] — это «mailtmp», сама команда в parts[1].
-        name = parts[1] if len(parts) > 1 else ""
-        if not name or name in seen or not re.match(r"^[a-z]", name):
+        name = parts[1]
+        if not re.match(r"^[a-z]", name) or name in seen:
             continue
-        desc = parts[2].strip() if len(parts) > 2 else ""
         seen.add(name)
-        keys.append((name, desc))
-    return keys
+        out.append((name, parts[2].strip() if len(parts) > 2 else ""))
+    return out
+
+
+# ------------------------------------------------------------------ хранение
+
+
+def load_ui():
+    try:
+        with open(UI_STATE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data.setdefault("starred", [])
+    data.setdefault("read", [])
+    data.setdefault("draft", "")
+    return data
+
+
+def save_ui(ui):
+    UI_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = UI_STATE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ui, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    tmp.replace(UI_STATE)
+
+
+def visible_len(text):
+    """Длина строки в колонках. Кириллица в терминале вдвое шире ASCII."""
+    return sum(2 if unicodedata_wide(ch) else 1 for ch in text)
+
+
+def clip(text, width):
+    """Обрезает по колонкам, а не по символам: русский текст иначе вылезет."""
+    if width <= 0:
+        return ""
+    out, used = [], 0
+    for ch in text:
+        w = 2 if unicodedata_wide(ch) else 1
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
+def pad(text, width):
+    return clip(text, width).ljust(width)
+
+
+def unicodedata_wide(ch):
+    import unicodedata
+    return unicodedata.east_asian_width(ch) in ("W", "F")
+
+
+class Panel:
+    """Три прямоугольника: сайдбар, список, чтение."""
+
+    def __init__(self, scr):
+        self.scr = scr
+        h, w = scr.getmaxyx()
+        self.h, self.w = h, w
+        self.narrow = w < 96 or h < 20
+        if self.narrow:
+            # Тесный терминал: одна панель, переключается по Tab.
+            self.side = None
+            self.list = (0, 0, w - 1, h - 1)
+            self.read = None
+            self.body = (0, 0, w - 1, h - 1)
+        else:
+            side_w = SIDEBAR_W
+            list_w = max(LIST_MIN, int(w * 0.42))
+            self.side = (0, 0, side_w - 1, h - 1)
+            self.list = (side_w, 0, list_w - 1, h - 1)
+            self.read = (side_w + list_w, 0, w - 1, h - 1)
+            self.body = self.list
+
+    def inside(self, r):
+        return self.side is not None and r == self.list
+
+    def top(self, r):
+        return 2
+
+    def bottom(self, r):
+        return self.h - 1
 
 
 class App:
-    def __init__(self, stdscr, want_new=False):
-        self.scr = stdscr
-        self.state = {}
+    FOCUS = ("side", "list", "read")
+
+    def __init__(self, scr, want_new=False):
+        self.scr = scr
+        self.ui = load_ui()
         self.items = []
         self.cursor = 0
         self.top = 0
-        self.view = "list"          # list | read | help | wait
-        self.message = ""
-        self.message_kind = "info"  # info | error | good
-        self.body = []
+        self.focus = "list"
+        self.status = "готов"
+        self.status_kind = "info"
+        self.search = ""
+        self.searching = False
+        self.view = "inbox"           # inbox | starred | search
         self.read_id = None
-        self.poll = 5.0
-        self.auto = False
-        self.last_poll = 0.0
+        self.read_scroll = 0
+        self.draft = self.ui.get("draft") or ""
         self.wait_until = 0.0
-        self.seen = set()
+        self.auto = False
+        self.poll = POLL_DEFAULT
+        self.last_poll = 0.0
         self.quit = False
+        self.p = Panel(scr)
         if want_new:
             self.new_address()
         else:
-            self.reload_state()
-            self.poll_inbox()
+            self.poll_inbox(quiet=True)
 
     # ------------------------------------------------------------ состояние
 
-    def reload_state(self):
-        self.state = core.load_state()
-
     @property
     def address(self):
-        return self.state.get("address") or ""
+        return core.load_state().get("address") or "(адреса нет — нажми N)"
 
     def note(self, text, kind="info"):
-        self.message = text
-        self.message_kind = kind
+        self.status = text
+        self.status_kind = kind
+
+    def filtered(self):
+        rows = self.items
+        if self.view == "starred":
+            rows = [i for i in rows if i["id"] in self.ui["starred"]]
+        if self.search:
+            needle = self.search.lower()
+            rows = [i for i in rows
+                    if needle in (i.get("subject") or "").lower()
+                    or needle in ((i.get("from") or {}).get("address") or "").lower()]
+        return rows
+
+    @property
+    def rows(self):
+        return self.filtered()
+
+    def is_starred(self, mid):
+        return mid in self.ui["starred"]
 
     # ---------------------------------------------------------------- сеть
 
-    def poll_inbox(self):
-        if not self.address:
+    def poll_inbox(self, quiet=False):
+        st = core.load_state()
+        if not st.get("token"):
             self.items = []
+            if not quiet:
+                self.note("нет адреса — нажми N, чтобы создать", "error")
             return
         try:
-            data = core.api("GET", "/messages", token=self.state["token"])
+            data = core.api("GET", "/messages", token=st["token"])
         except SystemExit:
-            # api() зовёт die(), а тот делает sys.exit — ловим и
-            # показываем в интерфейсе, а не убиваем TUI.
-            self.note("не смог получить inbox", "error")
+            # api() зовёт die(), а тот делает sys.exit: ловим, чтобы
+            # интерфейс жил, а не умирал вместе с запросом.
             self.items = []
+            self.note("сеть недоступна", "error")
             return
-        except Exception as exc:                       # noqa: BLE001
+        except Exception as exc:                      # noqa: BLE001
             self.note("сеть: %s" % exc, "error")
             return
         self.items = data.get("hydra:member") or data.get("member") or []
         self.items.sort(key=lambda i: i.get("createdAt", ""), reverse=True)
-        fresh = [i for i in self.items if i["id"] not in self.seen]
-        if fresh and self.seen:
-            self.note("новых писем: %d" % len(fresh), "good")
-        self.seen.update(i["id"] for i in self.items)
         self.last_poll = time.monotonic()
+        if not quiet:
+            self.note("обновлено: %d писем" % len(self.items), "good")
+        self.clamp()
 
     def new_address(self):
         try:
@@ -184,72 +288,89 @@ class App:
             self.note("сервис не вернул токен", "error")
             return
         core.save_state({"address": address, "password": password, "token": token})
-        self.reload_state()
-        self.seen.clear()
-        self.poll_inbox()
+        self.items = []
+        self.cursor = 0
+        self.read_id = None
         self.note("новый адрес: %s" % address, "good")
 
-    def fetch_body(self, mid):
+    def fetch(self, mid):
+        st = core.load_state()
         try:
-            return core.api("GET", "/messages/%s" % mid, token=self.state["token"])
+            return core.api("GET", "/messages/%s" % mid, token=st["token"])
         except SystemExit:
-            self.note("не смог открыть письмо", "error")
+            self.note("не удалось открыть письмо", "error")
             return None
 
     # ------------------------------------------------------------- действия
 
-    def open_selected(self):
-        if not self.items:
+    def current(self):
+        rows = self.rows
+        return rows[self.cursor] if 0 <= self.cursor < len(rows) else None
+
+    def open_message(self):
+        item = self.current()
+        if not item:
             self.note("письмо не выбрано", "error")
             return
-        msg = self.fetch_body(self.items[self.cursor]["id"])
+        msg = self.fetch(item["id"])
         if msg is None:
             return
-        self.read_id = self.items[self.cursor]["id"]
-        code, url = core.extract(msg)
-        frm = (msg.get("from") or {}).get("address", "?")
-        lines = [
-            "От:    %s" % frm,
-            "Тема:  %s" % (msg.get("subject") or "(без темы)"),
-            "Дата:  %s" % (msg.get("createdAt") or "")[:19],
-            "",
-        ]
-        if code:
-            lines.append("КОД:   %s" % code)
-        if url:
-            lines.append("ССЫЛКА: %s" % url)
-        if not code and not url:
-            lines.append("(код и ссылка не найдены)")
-        lines.append("")
-        lines.append("-" * 60)
-        body = []
-        for v in core._parts(msg.get("text")):
-            body.extend(v.splitlines())
-        if not body:
-            for v in core._parts(msg.get("html")):
-                body.extend(re.sub(r"<[^>]+>", " ", v).splitlines())
-        lines.extend(body or ["(пустое письмо)"])
-        self.body = lines
-        self.view = "read"
-        self.cursor_body = 0
+        self.read_id = item["id"]
+        self.read_scroll = 0
+        self.read_msg = msg
+        if item["id"] not in self.ui["read"]:
+            self.ui["read"].append(item["id"])
+            self.ui["read"] = self.ui["read"][-500:]
+            save_ui(self.ui)
+        if not self.p.narrow:
+            self.focus = "read"
+        else:
+            self.view_read = True
 
-    def delete_selected(self):
-        if not self.items:
+    def close_message(self):
+        self.read_id = None
+        self.view_read = False
+        if not self.p.narrow:
+            self.focus = "list"
+        else:
+            self.view_read = False
+
+    def toggle_star(self):
+        item = self.current()
+        if not item:
             return
-        item = self.items[self.cursor]
+        mid = item["id"]
+        if mid in self.ui["starred"]:
+            self.ui["starred"].remove(mid)
+            self.note("звезда снята", "info")
+        else:
+            self.ui["starred"].append(mid)
+            self.note("звезда поставлена", "good")
+        save_ui(self.ui)
+        self.clamp()
+
+    def delete_current(self):
+        item = self.current()
+        if not item:
+            return
+        st = core.load_state()
         try:
-            core.api("DELETE", "/messages/%s" % item["id"], token=self.state["token"])
+            core.api("DELETE", "/messages/%s" % item["id"], token=st["token"])
         except SystemExit:
             self.note("не удалось удалить", "error")
             return
+        if item["id"] in self.ui["starred"]:
+            self.ui["starred"].remove(item["id"])
+            save_ui(self.ui)
         self.note("письмо удалено", "good")
-        self.poll_inbox()
+        self.poll_inbox(quiet=True)
 
-    def copy_selected(self):
-        """Копирует код или ссылку письма. wl-copy может не быть."""
-        if not self.items:
+    def copy_code(self):
+        item = self.current()
+        if not item:
+            self.note("письмо не выбрано", "error")
             return
-        msg = self.fetch_body(self.items[self.cursor]["id"])
+        msg = self.fetch(item["id"])
         if msg is None:
             return
         code, url = core.extract(msg)
@@ -257,151 +378,314 @@ class App:
         if not text:
             self.note("в письме нет ни кода, ни ссылки", "error")
             return
-        import shutil
-        import subprocess
         if shutil.which("wl-copy"):
+            # Вывод уходит в /dev/null: wl-copy остаётся жить, удерживая
+            # буфер, и унаследовал бы наш stdout.
             subprocess.run(["wl-copy"], input=text.encode(),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.note("скопировано: %s" % text, "good")
-            return
-        # Без wl-copy показываем текст — его можно выделить вручную.
-        self.view = "read"
-        self.body = ["Нет wl-copy, скопируй вручную:", "", text]
-        self.note("wl-copy не найден — показано на экране", "error")
-
-    # ------------------------------------------------------------- отрисовка
-
-    def draw(self):
-        self.scr.erase()
-        h, w = self.scr.getmaxyx()
-        add = self.scr.addstr
-
-        title = "mailtmp-tui"
-        add(0, 0, title.ljust(w - 1)[: w - 1], curses.A_REVERSE)
-        add(1, 0, (" %s " % (self.address or "адреса нет — нажми n")).ljust(w - 1)[: w - 1])
-
-        # Область содержимого (строки 2..h-3) затираем ДО отрисовки:
-        # erase() помечает экран пустым, но там, где в прошлом кадре были
-        # длинные строки списка, без явной затирки остаются хвосты —
-        # это и портило переход в справку.
-        blank = " " * (w - 1)
-        for y in range(2, max(2, h - 3)):
-            try:
-                add(y, 0, blank)
-            except curses.error:
-                pass
-
-        if self.view == "read":
-            self.draw_read(h, w)
-        elif self.view == "help":
-            self.draw_help(h, w)
-        elif self.view == "wait":
-            self.draw_wait(h, w)
         else:
-            self.draw_list(h, w)
+            self.note("wl-copy нет: код = %s" % text, "error")
 
-        if self.message:
-            attr = curses.A_BOLD
-            if self.message_kind == "error":
-                attr |= curses.A_REVERSE
-            add(h - 2, 0, (" " + self.message)[: w - 1].ljust(w - 1), attr)
+    def clamp(self):
+        rows = self.rows
+        if not rows:
+            self.cursor = 0
+        else:
+            self.cursor = max(0, min(self.cursor, len(rows) - 1))
 
-        add(h - 1, 0, self.hint(h, w)[: w - 1].ljust(w - 1), curses.A_DIM)
-        self.scr.noutrefresh()
-        curses.doupdate()
+    # ------------------------------------------------------------ отрисовка
 
-    def hint(self, h, w):
-        if self.view == "read":
-            return "↑↓ прокрутка   c копировать   r обновить   Esc назад   q выход"
-        if self.view == "wait":
-            return "ждать осталось %d с…   r обновить   Esc отмена   q выход" % max(
-                0, int(self.wait_until - time.monotonic()))
-        return ("↑↓ выбор   Enter открыть   n новый адрес   r обновить   "
-                "d удалить   c код   w ждать   ? помощь   q выход")
+    def put(self, y, x, text, attr=0, width=None):
+        """Пишет строку, не давая curses упасть на правом нижнем углу.
 
-    def draw_list(self, h, w):
-        add = self.scr.addstr
-        if not self.items:
-            add(3, 2, "Писем нет.", curses.A_BOLD)
-            add(4, 2, "Отправьте что-нибудь на адрес выше, или нажмите r.")
+        width — сколько колонок ЗАХОТИЛИ занять от x, а не сколько
+        колонок осталось до края экрана. Ошибочное толкование убивало всё,
+        что правее узкой колонки: limit уходил в минус, и put() выходил
+        молча, оставляя панели пустыми.
+        """
+        if y < 0 or y >= self.p.h or x < 0 or x >= self.p.w:
             return
-        rows = h - 5
+        avail = self.p.w - 1 - x
+        limit = min(width, avail) if width is not None else avail
+        if limit <= 0:
+            return
+        try:
+            self.scr.addstr(y, x, clip(text, limit), attr)
+        except curses.error:
+            pass
+
+    def frame(self, r):
+        """Прямоугольник изяркой линией — границы панелей."""
+        x0, y0, x1, y1 = r
+        if y1 - y0 < 2 or x1 - x0 < 2:
+            return
+        for x in range(x0 + 1, x1):
+            self.put(y0, x, "─")
+            self.put(y1, x, "─")
+        for y in range(y0 + 1, y1):
+            self.put(y, x0, "│")
+            self.put(y, x1, "│")
+        self.put(y0, x0, "┌")
+        self.put(y0, x1, "┐")
+        self.put(y1, x0, "└")
+        self.put(y1, x1, "┘")
+
+    def bar(self):
+        h, w = self.p.h, self.p.w
+        left = "mailtmp"
+        mid = (" /%s" % self.search) if self.search else ""
+        right = self.address
+        line = left + mid
+        gap = max(1, w - visible_len(line) - visible_len(right) - 2)
+        self.put(0, 0, line + " " * gap + right, curses.A_REVERSE, w)
+
+    def sidebar(self):
+        if not self.p.side:
+            return
+        x0, y0, x1, y1 = self.p.side
+        self.frame(self.p.side)
+        w = x1 - x0 - 2
+        unread = [i for i in self.items if i["id"] not in self.ui["read"]]
+        entries = [
+            ("inbox", "Входящие", len(self.items), len(unread)),
+            ("starred", "Отмеченные", len(self.ui["starred"]), 0),
+        ]
+        y = y0 + 2
+        self.put(y, x0 + 2, "ПОЧТА", curses.A_BOLD, w)
+        y += 2
+        for key, title, total, new in entries:
+            sel = self.view == key
+            label = "%s  %d" % (title, total)
+            if new:
+                label = "%s  %d*" % (title, new)
+            self.put(y, x0 + 2, pad(label, w),
+                     curses.A_REVERSE if sel else curses.A_NORMAL, w)
+            y += 1
+        y += 1
+        self.put(y, x0 + 2, "ОТПРАВКА", curses.A_BOLD, w)
+        y += 2
+        self.put(y, x0 + 2, pad("Черновик", w))
+        y += 1
+        self.put(y + 1, x0 + 2, pad(clip(self.draft or "(пусто)", w), w),
+                 curses.A_DIM, w)
+        y += 3
+        self.put(y, x0 + 2, "N  новый адрес", curses.A_DIM, w)
+        self.put(y + 1, x0 + 2, "r  обновить", curses.A_DIM, w)
+        self.put(y + 2, x0 + 2, "?  помощь", curses.A_DIM, w)
+        self.put(y + 3, x0 + 2, "q  выход", curses.A_DIM, w)
+
+    def messages(self):
+        if not self.p.list:
+            return
+        x0, y0, x1, y1 = self.p.list
+        self.frame(self.p.list)
+        w = x1 - x0 - 2
+        title = {"inbox": "Входящие", "starred": "Отмеченные"}.get(self.view, "Поиск")
+        self.put(y0 + 1, x0 + 2, clip("%s — %d" % (title, len(self.rows)), w),
+                 curses.A_BOLD, w)
+
+        rows = self.rows
+        if not rows:
+            hint = "Писем нет" if not self.search else "Ничего не найдено"
+            self.put(y0 + 4, x0 + 2, hint, curses.A_DIM, w)
+            if not self.items and not self.search:
+                self.put(y0 + 6, x0 + 2, "N — создать адрес", curses.A_DIM, w)
+            return
+
+        top = y0 + 2
+        # Письмо занимает ДВЕ строки: заголовок и тема. Шаг по списку
+        # равен двум, иначе темы наезжают на следующие заголовки.
+        slots = max(0, (y1 - y0 - 3) // 2)
         if self.cursor < self.top:
             self.top = self.cursor
-        if self.cursor >= self.top + rows:
-            self.top = self.cursor - rows + 1
-        add(3, 0, " %-8s %-19s %-30s %s" % ("id", "когда", "от кого", "тема"))
-        for row in range(rows):
-            idx = self.top + row
-            if idx >= len(self.items):
+        if self.cursor >= self.top + slots:
+            self.top = self.cursor - slots + 1
+
+        when_w = 11
+        frm_w = max(10, w - 2 - when_w - 1)
+        for slot in range(slots):
+            idx = self.top + slot
+            if idx >= len(rows):
                 break
-            it = self.items[idx]
-            frm = (it.get("from") or {}).get("address", "?")
-            line = " %-8s %-19s %-30s %s" % (
-                it["id"][:8], (it.get("createdAt") or "")[:19],
-                frm[:30], (it.get("subject") or "")[: max(0, w - 62)])
-            attr = curses.A_REVERSE if idx == self.cursor else curses.A_NORMAL
-            add(4 + row, 0, line[: w - 1].ljust(w - 1), attr)
-        add(h - 3, 0, ("всего %d, показано с %d   опрос: %s"
-                       % (len(self.items), self.top + 1,
-                          ("%.0f с, авто" % self.poll) if self.auto else "вручную"))[: w - 1],
-            curses.A_DIM)
+            it = rows[idx]
+            frm = (it.get("from") or {}).get("address") or "?"
+            subj = it.get("subject") or "(без темы)"
+            when = (it.get("createdAt") or "")[5:16].replace("T", " ")
+            unread = it["id"] not in self.ui["read"]
+            flags = ("★" if self.is_starred(it["id"]) else " ")
+            flags += "●" if unread else " "
+            attr = curses.A_NORMAL
+            if idx == self.cursor:
+                attr = curses.A_REVERSE
+            elif unread:
+                attr = curses.A_BOLD
+            y = top + slot * 2
+            self.put(y, x0 + 2,
+                     pad("%s%s %s" % (flags, clip(frm, frm_w), clip(when, when_w)), w),
+                     attr, w)
+            if y + 1 <= y1 - 1:
+                self.put(y + 1, x0 + 4, pad(clip(subj, w - 2), w - 2), attr, w - 2)
 
-    def draw_read(self, h, w):
-        add = self.scr.addstr
-        rows = h - 5
-        for row in range(rows):
-            idx = getattr(self, "cursor_body", 0) + row
-            if idx >= len(self.body):
+    def reader(self):
+        if not self.p.read:
+            return
+        x0, y0, x1, y1 = self.p.read
+        self.frame(self.p.read)
+        w = x1 - x0 - 2
+        if not self.read_id:
+            self.put(y0 + 2, x0 + 3, "Выбери письмо слева", curses.A_DIM, w)
+            self.put(y0 + 3, x0 + 3, "или нажми Enter", curses.A_DIM, w)
+            return
+        msg = getattr(self, "read_msg", None) or {}
+        code, url = core.extract(msg)
+        lines = []
+        lines.append("От:    %s" % ((msg.get("from") or {}).get("address") or "?"))
+        lines.append("Тема:  %s" % (msg.get("subject") or "(без темы)"))
+        lines.append("Дата:  %s" % (msg.get("createdAt") or "")[:19])
+        lines.append("")
+        if code:
+            lines.append("КОД: %s" % code)
+        if url:
+            lines.append("ССЫЛКА: %s" % url)
+        if not code and not url:
+            lines.append("(код и ссылка не найдены)")
+        lines.append("")
+        lines.append("─" * min(w, 60))
+        body = []
+        for v in core._parts(msg.get("text")):
+            body.extend(v.splitlines())
+        if not body:
+            for v in core._parts(msg.get("html")):
+                body.extend(re.sub(r"<[^>]+>", " ", v).splitlines())
+        lines.extend(body or ["(пустое письмо)"])
+
+        if self.focus == "read":
+            self.read_scroll = max(0, min(self.read_scroll, max(0, len(lines) - 1)))
+        else:
+            self.read_scroll = 0
+        room = y1 - y0 - 3
+        for row in range(max(0, room)):
+            idx = self.read_scroll + row
+            if idx >= len(lines):
                 break
-            add(3 + row, 0, self.body[idx][: w - 1].ljust(w - 1))
-        total = len(self.body)
-        shown = min(rows, total)
-        add(h - 3, 0, ("строка %d из %d" % (getattr(self, "cursor_body", 0) + 1, total))[: w - 1],
-            curses.A_DIM)
+            attr = curses.A_BOLD if idx < 6 and lines[idx].startswith(("КОД", "ССЫЛКА")) else 0
+            self.put(y0 + 2 + row, x0 + 2, pad(lines[idx], w), attr, w)
 
-    def draw_help(self, h, w):
-        add = self.scr.addstr
-        rows = h - 7
-        cmds = load_breaks(core)
-        add(3, 2, "Команды mailtmp", curses.A_BOLD)
-        for i, (name, desc) in enumerate(cmds[:rows]):
-            add(4 + i, 2, ("  %-10s %s" % (name, desc))[: w - 3])
-        nxt = 5 + min(len(cmds), rows)
-        if nxt < h - 5:
-            add(nxt, 2, "Плюс в этом интерфейсе:", curses.A_BOLD)
-            add(nxt + 1, 2, "  ↑↓ выбор, Enter открыть, n новый адрес, r обновить,")
-            add(nxt + 2, 2, "  d удалить письмо, c скопировать код, s авто-обновление,")
-            add(nxt + 3, 2, "  w ждать новое письмо, ? эта справка, q выход")
+    def footer(self):
+        h, w = self.p.h, self.p.w
+        if self.searching:
+            line = "Поиск: %s_" % self.search
+            self.put(h - 1, 0, pad(line, w - 1), curses.A_BOLD, w)
+            return
+        if self.wait_until:
+            left = max(0, int(self.wait_until - time.monotonic()))
+            keys = "ждать %d с   r обновить   Esc отмена" % left
+        else:
+            keys = ("↑↓ выбор  Enter открыть  u назад  n ждать  N новый адрес  "
+                    "r обновить  d удалить  s звезда  / поиск  Tab панель  "
+                    "A авто  ? помощь  q выход")
+            if self.auto:
+                keys = "авто-обновление каждые %.0f с   " % self.poll + keys
+        self.put(h - 1, 0, pad(clip(keys, w - 1), w - 1), curses.A_DIM, w)
 
-    def draw_wait(self, h, w):
-        add = self.scr.addstr
-        left = max(0, int(self.wait_until - time.monotonic()))
-        add(3, 4, "Жду новое письмо на %s" % self.address)
-        add(4, 4, "осталось %d с" % left)
-        add(5, 4, "тик. " * (left // 10 + 1))
-        add(6, 4, "уже в inbox: %d" % len(self.items))
+    def statusbar(self):
+        h, w = self.p.h, self.p.w
+        if not self.status:
+            return
+        attr = curses.A_BOLD
+        if self.status_kind == "error":
+            attr |= curses.A_REVERSE
+        self.put(h - 2, 0, pad(" " + clip(self.status, w - 1), w - 1), attr, w)
+
+    def help(self):
+        self.scr.erase()
+        h, w = self.p.h, self.p.w
+        self.put(0, 0, pad("mailtmp — помощь", w - 1), curses.A_REVERSE, w)
+        rows = []
+        rows.append(("В письме", ""))
+        rows.extend([
+            ("↑ ↓ j k", "выбор письма"),
+            ("Enter", "открыть в панели чтения"),
+            ("u", "вернуться к списку"),
+            ("d", "удалить письмо"),
+            ("s", "звезда"),
+            ("c", "скопировать код в буфер"),
+            ("n", "ждать новое письмо"),
+        ])
+        rows.append(("", ""))
+        rows.append(("Панели", ""))
+        rows.extend([
+            ("Tab", "следующая панель"),
+            ("1 2 3", "сайдбар, список, чтение"),
+            ("/", "поиск"),
+            ("c", "очистить поиск"),
+        ])
+        rows.append(("", ""))
+        rows.append(("Аккаунт", ""))
+        rows.extend([
+            ("N", "новый адрес"),
+            ("r", "обновить inbox"),
+            ("A", "включить авто-обновление"),
+            ("?", "эта помощь"),
+            ("q", "выход"),
+        ])
+        y = 2
+        for key, desc in rows:
+            if y > h - 2:
+                break
+            self.put(y, 2, pad(key, 10), curses.A_BOLD)
+            self.put(y, 13, clip(desc, w - 15))
+            y += 1
+        y += 1
+        self.put(y, 2, "Команды mailtmp", curses.A_BOLD)
+        y += 1
+        for name, desc in cli_commands()[: max(0, h - y - 3)]:
+            self.put(y, 4, pad(name, 10))
+            self.put(y, 15, clip(desc, w - 17))
+            y += 1
+
+    def draw(self):
+        if self.view == "help":
+            self.help()
+            self.footer()
+            self.scr.noutrefresh()
+            curses.doupdate()
+            return
+        self.scr.erase()
+        self.bar()
+        self.sidebar()
+        self.messages()
+        self.reader()
+        self.statusbar()
+        self.footer()
+        self.scr.noutrefresh()
+        curses.doupdate()
 
     # ---------------------------------------------------------------- цикл
 
     def tick(self):
         now = time.monotonic()
-        if self.view == "wait":
+        if self.wait_until:
             if now >= self.wait_until:
                 before = len(self.items)
-                self.poll_inbox()
+                self.poll_inbox(quiet=True)
+                self.wait_until = 0.0
                 if len(self.items) > before:
-                    self.open_selected()
+                    self.cursor = 0
+                    self.open_message()
                     self.note("письмо пришло", "good")
                 else:
-                    self.view = "list"
                     self.note("время вышло, новых писем нет", "error")
             return
         if self.auto and now - self.last_poll >= self.poll:
-            self.poll_inbox()
+            self.poll_inbox(quiet=True)
 
     def loop(self):
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
         self.scr.keypad(True)
         while not self.quit:
             self.tick()
@@ -413,89 +697,118 @@ class App:
             self.handle(ch)
 
     def handle(self, ch):
-        h, w = self.scr.getmaxyx()
-        if self.view == "read":
-            self.handle_read(ch, h)
+        if self.view == "help":
+            if ch in (ord("?"), 27, ord("q"), 10, 13):
+                self.view = None
             return
-        if self.view == "wait":
-            if ch in (27, ord("q")):
-                self.view = "list"
-            elif ch == ord("r"):
-                self.poll_inbox()
+        if self.searching:
+            self.handle_search(ch)
+            return
+        if self.wait_until and ch in (27, ord("q")):
+            self.wait_until = 0.0
+            self.note("ожидание отменено", "info")
             return
 
-        if ch in (ord("q"), 27):
-            self.quit = True
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            if self.items and self.cursor < len(self.items) - 1:
+        rows = self.rows
+        # Действие над выбранным письмом работает в списке и в чтении.
+        if ch == ord("d"):
+            self.delete_current()
+            return
+        if ch == ord("s"):
+            self.toggle_star()
+            return
+        if ch == ord("c"):
+            if self.search:
+                self.search = ""
+                self.clamp()
+                self.note("поиск очищен", "info")
+            else:
+                self.copy_code()
+            return
+
+        if ch in (9,):                     # Tab
+            order = self.FOCUS
+            if self.p.narrow:
+                self.note("узкий терминал: панели слиты", "info")
+            else:
+                self.focus = order[(order.index(self.focus) + 1) % len(order)]
+            return
+        if ch in (ord("1"), ord("2"), ord("3")) and not self.p.narrow:
+            self.focus = {"1": "side", "2": "list", "3": "read"}[chr(ch)]
+            return
+
+        if ch in (curses.KEY_DOWN, ord("j")):
+            if rows and self.cursor < len(rows) - 1:
                 self.cursor += 1
-        elif ch in (curses.KEY_UP, ord("k")):
+            return
+        if ch in (curses.KEY_UP, ord("k")):
             if self.cursor > 0:
                 self.cursor -= 1
-        elif ch in (curses.KEY_NPAGE,):
-            self.cursor = min(len(self.items) - 1, self.cursor + max(1, h - 6))
-        elif ch in (curses.KEY_PPAGE,):
-            self.cursor = max(0, self.cursor - max(1, h - 6))
-        elif ch in (ord("g"),):
+            return
+        if ch in (curses.KEY_NPAGE,):
+            self.cursor = min(len(rows) - 1, self.cursor + 10)
+            return
+        if ch in (curses.KEY_PPAGE,):
+            self.cursor = max(0, self.cursor - 10)
+            return
+        if ch == ord("g"):
             self.cursor = 0
-        elif ch in (ord("G"),):
-            self.cursor = max(0, len(self.items) - 1)
-        elif ch in (10, 13, curses.KEY_ENTER):
-            self.open_selected()
-        elif ch == ord("n"):
+            return
+        if ch == ord("G"):
+            self.cursor = max(0, len(rows) - 1)
+            return
+
+        if ch in (10, 13, curses.KEY_ENTER):
+            self.open_message()
+        elif ch in (ord("u"), 27):
+            self.close_message()
+        elif ch == ord("N"):
             self.new_address()
         elif ch == ord("r"):
             self.poll_inbox()
-            self.note("обновлено: %d писем" % len(self.items), "good")
-        elif ch == ord("d"):
-            self.delete_selected()
-        elif ch == ord("c"):
-            self.copy_selected()
-        elif ch == ord("w"):
-            self.view = "wait"
+        elif ch == ord("n"):
             self.wait_until = time.monotonic() + 90
-            self.seen.clear()
-        elif ch == ord("?"):
-            self.view = "help"
-        elif ch == ord("s"):
+            self.note("жду новое письмо 90 с", "info")
+        elif ch == ord("A"):
             self.auto = not self.auto
             self.note("авто-обновление: %s" % ("вкл" if self.auto else "выкл"), "good")
+        elif ch == ord("/"):
+            self.searching = True
+            self.search = ""
+            self.note("введи запрос, Enter — применить, Esc — отмена", "info")
+        elif ch == ord("?"):
+            self.view = "help"
+        elif ch == ord("q"):
+            self.quit = True
 
-    def handle_read(self, ch, h):
-        total = max(1, len(self.body))
-        page = max(1, h - 6)
-        if ch in (27, ord("q")):
-            self.view = "list"
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor_body = min(total - 1, getattr(self, "cursor_body", 0) + 1)
-        elif ch in (curses.KEY_UP, ord("k")):
-            self.cursor_body = max(0, getattr(self, "cursor_body", 0) - 1)
-        elif ch == curses.KEY_NPAGE:
-            self.cursor_body = min(total - 1, getattr(self, "cursor_body", 0) + page)
-        elif ch == curses.KEY_PPAGE:
-            self.cursor_body = max(0, getattr(self, "cursor_body", 0) - page)
-        elif ch in (curses.KEY_HOME, ord("g")):
-            self.cursor_body = 0
-        elif ch == ord("c"):
-            self.copy_selected()
-        elif ch == ord("r"):
-            self.poll_inbox()
-            self.note("обновлено", "good")
-        elif ch == ord("n"):
-            self.view = "list"
-            self.new_address()
+    def handle_search(self, ch):
+        if ch == 27:
+            self.searching = False
+            self.search = ""
+            self.clamp()
+            self.note("поиск отменён", "info")
+        elif ch in (10, 13):
+            self.searching = False
+            self.view = "search" if self.search else "inbox"
+            self.cursor = 0
+            self.clamp()
+            self.note("найдено %d" % len(self.rows), "good" if self.rows else "info")
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.search = self.search[:-1]
+        elif 32 <= ch < 127:
+            self.search += chr(ch)
+        self.clamp()
 
 
 def main():
-    want_new = len(sys.argv) > 1 and sys.argv[1] == "new"
-    st = core.load_state()
-    if not want_new and not st.get("address"):
+    args = sys.argv[1:]
+    want_new = bool(args) and args[0] == "new"
+    if not args and not core.load_state().get("address"):
         want_new = True
     try:
         curses.wrapper(lambda s: App(s, want_new).loop())
     except KeyboardInterrupt:
         pass
-    print("адрес: %s" % core.load_state().get("address", "(нет)"))
 
 
 if __name__ == "__main__":
