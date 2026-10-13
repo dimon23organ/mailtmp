@@ -56,7 +56,9 @@ UI_STATE = Path(os.path.expanduser("~/.local/state/mailtmp-tui.json"))
 POLL_DEFAULT = 5.0
 SIDEBAR_W = 22
 LIST_MIN = 30
-POLL_MIN, POLL_MAX = 1, 300
+
+# Папки сайдбара. Порядок задаёт и курсор боковой панели.
+FOLDERS = (("inbox", "Входящие"), ("starred", "Отмеченные"))
 
 
 def load_core():
@@ -156,17 +158,20 @@ class Panel:
         self.h, self.w = h, w
         self.narrow = w < 96 or h < 20
         if self.narrow:
-            # Тесный терминал: одна панель, переключается по Tab.
+            # Тесный терминал: одна область, переключается по Tab.
+            # read указывает на ту же область — иначе reader() выходит
+            # сразу и Enter в узком окне не показывает письмо вовсе.
+            full = (0, 1, w - 1, h - 1)
             self.side = None
-            self.list = (0, 0, w - 1, h - 1)
-            self.read = None
-            self.body = (0, 0, w - 1, h - 1)
+            self.list = full
+            self.read = full
+            self.body = full
         else:
             side_w = SIDEBAR_W
             list_w = max(LIST_MIN, int(w * 0.42))
-            self.side = (0, 0, side_w - 1, h - 1)
-            self.list = (side_w, 0, list_w - 1, h - 1)
-            self.read = (side_w + list_w, 0, w - 1, h - 1)
+            self.side = (0, 1, side_w - 1, h - 1)
+            self.list = (side_w, 1, list_w - 1, h - 1)
+            self.read = (side_w + list_w, 1, w - 1, h - 1)
             self.body = self.list
 
     def inside(self, r):
@@ -193,10 +198,13 @@ class App:
         self.status_kind = "info"
         self.search = ""
         self.searching = False
-        self.view = "inbox"           # inbox | starred | search
+        self.folder = "inbox"         # inbox | starred
+        self.side_cursor = 0          # курсор по папкам сайдбара
+        self.screen = "mail"          # mail | help
+        self.narrow_page = "list"     # в узком терминале: что показано
         self.read_id = None
         self.read_scroll = 0
-        self.draft = self.ui.get("draft") or ""
+        self.read_msg = None
         self.wait_until = 0.0
         self.auto = False
         self.poll = POLL_DEFAULT
@@ -220,7 +228,7 @@ class App:
 
     def filtered(self):
         rows = self.items
-        if self.view == "starred":
+        if self.folder == "starred":
             rows = [i for i in rows if i["id"] in self.ui["starred"]]
         if self.search:
             needle = self.search.lower()
@@ -322,18 +330,18 @@ class App:
             self.ui["read"].append(item["id"])
             self.ui["read"] = self.ui["read"][-500:]
             save_ui(self.ui)
-        if not self.p.narrow:
-            self.focus = "read"
+        if self.p.narrow:
+            self.narrow_page = "read"
         else:
-            self.view_read = True
+            self.focus = "read"
 
     def close_message(self):
         self.read_id = None
-        self.view_read = False
-        if not self.p.narrow:
-            self.focus = "list"
+        self.read_msg = None
+        if self.p.narrow:
+            self.narrow_page = "list"
         else:
-            self.view_read = False
+            self.focus = "list"
 
     def toggle_star(self):
         item = self.current()
@@ -446,44 +454,64 @@ class App:
         x0, y0, x1, y1 = self.p.side
         self.frame(self.p.side)
         w = x1 - x0 - 2
+        active = self.focus == "side"
         unread = [i for i in self.items if i["id"] not in self.ui["read"]]
-        entries = [
-            ("inbox", "Входящие", len(self.items), len(unread)),
-            ("starred", "Отмеченные", len(self.ui["starred"]), 0),
-        ]
+        counts = {"inbox": (len(self.items), len(unread)),
+                  "starred": (len(self.ui["starred"]), 0)}
         y = y0 + 2
         self.put(y, x0 + 2, "ПОЧТА", curses.A_BOLD, w)
         y += 2
-        for key, title, total, new in entries:
-            sel = self.view == key
+        for idx, (key, title) in enumerate(FOLDERS):
+            total, new = counts[key]
+            sel = self.folder == key
             label = "%s  %d" % (title, total)
             if new:
                 label = "%s  %d*" % (title, new)
-            self.put(y, x0 + 2, pad(label, w),
-                     curses.A_REVERSE if sel else curses.A_NORMAL, w)
+            attr = curses.A_NORMAL
+            if sel and active:
+                attr = curses.A_REVERSE
+            elif sel:
+                attr = curses.A_BOLD
+            self.put(y, x0 + 2, pad(label, w), attr, w)
+            # Пункт под курсором помечаем, иначе в неактивной панели
+            # непонятно, где ты находишься.
+            if idx == self.side_cursor:
+                mark = "▸" if not sel else "›"
+                self.put(y, x0 + 1, mark)
             y += 1
         y += 1
-        self.put(y, x0 + 2, "ОТПРАВКА", curses.A_BOLD, w)
+        self.put(y, x0 + 2, "СОСТОЯНИЕ", curses.A_BOLD, w)
         y += 2
-        self.put(y, x0 + 2, pad("Черновик", w))
-        y += 1
-        self.put(y + 1, x0 + 2, pad(clip(self.draft or "(пусто)", w), w),
-                 curses.A_DIM, w)
-        y += 3
-        self.put(y, x0 + 2, "N  новый адрес", curses.A_DIM, w)
-        self.put(y + 1, x0 + 2, "r  обновить", curses.A_DIM, w)
-        self.put(y + 2, x0 + 2, "?  помощь", curses.A_DIM, w)
-        self.put(y + 3, x0 + 2, "q  выход", curses.A_DIM, w)
+        stats = [
+            ("прочитано", "%d" % (len(self.items) - len(unread))),
+            ("звёзд", "%d" % len(self.ui["starred"])),
+            ("поиск", self.search or "нет"),
+        ]
+        for title, value in stats:
+            self.put(y, x0 + 2, pad(title, w), curses.A_DIM, w)
+            y += 1
+            self.put(y, x0 + 4, pad(clip(value, w - 2), w - 2))
+            y += 2
+        self.put(y, x0 + 2, "N новый адрес", curses.A_DIM, w)
+        self.put(y + 1, x0 + 2, "r обновить", curses.A_DIM, w)
+        self.put(y + 2, x0 + 2, "? помощь", curses.A_DIM, w)
+        self.put(y + 3, x0 + 2, "q выход", curses.A_DIM, w)
 
     def messages(self):
         if not self.p.list:
             return
+        # В узком терминале та же область рисует либо список, либо чтение.
+        if self.p.narrow and self.narrow_page == "read":
+            return
         x0, y0, x1, y1 = self.p.list
         self.frame(self.p.list)
         w = x1 - x0 - 2
-        title = {"inbox": "Входящие", "starred": "Отмеченные"}.get(self.view, "Поиск")
+        title = {"inbox": "Входящие", "starred": "Отмеченные"}.get(self.folder, "Поиск")
+        # Активная панель помечается жирным: в трёхпанельном виде
+        # непонятно, куда пойдёт Enter.
+        head_attr = curses.A_BOLD | (0 if self.focus == "list" else curses.A_DIM)
         self.put(y0 + 1, x0 + 2, clip("%s — %d" % (title, len(self.rows)), w),
-                 curses.A_BOLD, w)
+                 head_attr, w)
 
         rows = self.rows
         if not rows:
@@ -529,6 +557,8 @@ class App:
 
     def reader(self):
         if not self.p.read:
+            return
+        if self.p.narrow and self.narrow_page != "read":
             return
         x0, y0, x1, y1 = self.p.read
         self.frame(self.p.read)
@@ -646,7 +676,7 @@ class App:
             y += 1
 
     def draw(self):
-        if self.view == "help":
+        if self.screen == "help":
             self.help()
             self.footer()
             self.scr.noutrefresh()
@@ -697,9 +727,9 @@ class App:
             self.handle(ch)
 
     def handle(self, ch):
-        if self.view == "help":
+        if self.screen == "help":
             if ch in (ord("?"), 27, ord("q"), 10, 13):
-                self.view = None
+                self.screen = "mail"
             return
         if self.searching:
             self.handle_search(ch)
@@ -727,22 +757,30 @@ class App:
             return
 
         if ch in (9,):                     # Tab
-            order = self.FOCUS
             if self.p.narrow:
-                self.note("узкий терминал: панели слиты", "info")
-            else:
-                self.focus = order[(order.index(self.focus) + 1) % len(order)]
+                # Узкий терминал: переключаем список и чтение.
+                self.narrow_page = "list" if self.narrow_page == "read" else "read"
+                if self.narrow_page == "read" and not self.read_id:
+                    self.narrow_page = "list"
+                    self.note("письмо не открыто — нажми Enter", "info")
+                return
+            order = self.FOCUS
+            self.focus = order[(order.index(self.focus) + 1) % len(order)]
             return
         if ch in (ord("1"), ord("2"), ord("3")) and not self.p.narrow:
             self.focus = {"1": "side", "2": "list", "3": "read"}[chr(ch)]
             return
 
         if ch in (curses.KEY_DOWN, ord("j")):
-            if rows and self.cursor < len(rows) - 1:
+            if self.focus == "side":
+                self.side_cursor = min(len(FOLDERS) - 1, self.side_cursor + 1)
+            elif rows and self.cursor < len(rows) - 1:
                 self.cursor += 1
             return
         if ch in (curses.KEY_UP, ord("k")):
-            if self.cursor > 0:
+            if self.focus == "side":
+                self.side_cursor = max(0, self.side_cursor - 1)
+            elif self.cursor > 0:
                 self.cursor -= 1
             return
         if ch in (curses.KEY_NPAGE,):
@@ -759,6 +797,15 @@ class App:
             return
 
         if ch in (10, 13, curses.KEY_ENTER):
+            # В сайдбаре Enter открывает папку, а не письмо.
+            if self.focus == "side":
+                key = FOLDERS[self.side_cursor][0]
+                self.folder = key
+                self.cursor = 0
+                self.top = 0
+                self.note("папка: %s" % FOLDERS[self.side_cursor][1],
+                          "good" if self.rows else "info")
+                return
             self.open_message()
         elif ch in (ord("u"), 27):
             self.close_message()
@@ -777,7 +824,7 @@ class App:
             self.search = ""
             self.note("введи запрос, Enter — применить, Esc — отмена", "info")
         elif ch == ord("?"):
-            self.view = "help"
+            self.screen = "help"
         elif ch == ord("q"):
             self.quit = True
 
@@ -789,7 +836,8 @@ class App:
             self.note("поиск отменён", "info")
         elif ch in (10, 13):
             self.searching = False
-            self.view = "search" if self.search else "inbox"
+            if not self.search:
+                self.folder = "inbox"
             self.cursor = 0
             self.clamp()
             self.note("найдено %d" % len(self.rows), "good" if self.rows else "info")

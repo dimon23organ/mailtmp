@@ -197,11 +197,18 @@ def main():
     cursor = [0, 0]
     frames = []
 
-    def drain(seconds):
-        end = time.monotonic() + seconds
+    def drain(seconds, idle=0.35):
+        """Читает вывод, пока он идёт, и жмёт наглухо паузу idle секунд.
+
+        Фиксированный sleep ненадёжен: если программа успела отрисовать
+        раньше, кадр терялся, и нажатия выглядели неработающими. Теперь
+        ждём реальных данных.
+        """
+        deadline = time.monotonic() + seconds
         chunk = b""
-        while time.monotonic() < end:
-            r, _, _ = select.select([fd], [], [], 0.1)
+        last = time.monotonic()
+        while time.monotonic() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.05)
             if fd in r:
                 try:
                     part = os.read(fd, 65536)
@@ -210,20 +217,43 @@ def main():
                 if not part:
                     break
                 chunk += part
+                last = time.monotonic()
+            elif chunk and time.monotonic() - last >= idle:
+                break
         return chunk
+
+    # ncurses с keypad(True) высылает smkx и ждёт прикладную форму
+    # стрелок: ESC O A/B/C/D, а не ESC [ A/B/C/D. Настоящий терминал
+    # переключается сам, псевдотерминал — нет. Поэтому probe держит флаг
+    # прикладного режима и сам переписывает CSI в SS3, иначе стрелки
+    # выглядят сломанными, хотя в живом терминале работают.
+    app_mode = {"on": False}
+
+    def send(key):
+        data = key.encode()
+        if app_mode["on"] and len(data) == 3 and data[:2] == b"\x1b[":
+            if data[2:3] in (b"A", b"B", b"C", b"D", b"H", b"F"):
+                data = b"\x1bO" + data[2:3]
+        try:
+            os.write(fd, data)
+        except OSError:
+            pass
+
+    for key in KEYS:
+        send(key)
 
     chunks = []
     first = drain(2.5)  # запуск, первый кадр
+    # smkx = ESC [ ? 1 h — терминал переведён в прикладной режим.
+    if b"\x1b[?1h" in first:
+        app_mode["on"] = True
     feed(strip_ansi(first), grid, cursor)
     chunks.append(first)
     frames.append(("старт", snapshot(grid)))
 
     for key in KEYS:
-        try:
-            os.write(fd, key.encode())
-        except OSError:
-            break
-        chunk = drain(1.2)
+        send(key)
+        chunk = drain(3.0)
         if not chunk:
             continue
         chunks.append(chunk)

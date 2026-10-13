@@ -208,8 +208,24 @@ python3 tests/test_extract.py
 33 tests. `TestApiShapes` encodes the real responses verbatim — including the
 one that caused bug 3.
 
+`tests/test_tui_keys.py` covers the client's navigation, search, stars and
+layout — 22 tests, no terminal involved:
+
+```bash
+python3 tests/test_tui_keys.py
+```
+
+The client itself is checked visually: `tests/fake_tui.py` substitutes canned
+messages for the network, and `tools/tui_probe.py` runs it in a
+pseudo-terminal and prints a text frame. That last one is a convenience, not a
+regression test — key delivery through a pty depends on redraw timing, so the
+behavioural checks live in the unit tests instead.
+
 Live mail delivery is **not** covered by automated tests — sending SMTP mail
 from a test environment is not reliably possible. Verify it once by hand.
+
+Sending is not supported at all: `POST /messages` answers `405 Method Not
+Allowed`. mail.tm is receive-only, so the client has no compose form.
 
 ## License
 
